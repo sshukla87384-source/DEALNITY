@@ -1,0 +1,177 @@
+import { prisma } from "@gis/database";
+import { sha256Hex } from "@gis/shared";
+import { randomBytes } from "node:crypto";
+import { getRedis } from "./redis.js";
+
+const KEY_PREFIX = "deal_live_";
+
+/** Scopes a developer key can hold (read-only public API v1). */
+export const API_SCOPES = ["catalog:read", "orders:read", "orders:write", "wallet:read", "analytics:read"] as const;
+export type ApiScope = (typeof API_SCOPES)[number];
+
+export interface CreatedApiKey {
+  id: string;
+  apiKey: string; // full secret — shown ONCE
+  prefix: string;
+}
+
+export async function createApiKey(input: {
+  name: string;
+  scopes: string[];
+  rateLimitPerMin?: number;
+  expiresAt?: Date | null;
+  ownerUserId?: string;
+}): Promise<CreatedApiKey> {
+  // 32 bytes = the 256-bit key the security doc promises; 24 was 192-bit.
+  // Nothing anywhere reads a fixed length — the prefix shown is a slice, the
+  // stored hash is SHA-256 either way — so older keys keep working untouched.
+  const raw = KEY_PREFIX + randomBytes(32).toString("hex"); // deal_live_<64 hex>
+  const keyHash = sha256Hex(raw);
+  const prefix = raw.slice(0, 16);
+  const scopes = input.scopes.filter((s) => (API_SCOPES as readonly string[]).includes(s));
+  const rec = await prisma.apiKey.create({
+    data: {
+      name: input.name.slice(0, 120),
+      keyHash,
+      prefix,
+      scopes,
+      rateLimitPerMin: input.rateLimitPerMin ?? 120,
+      expiresAt: input.expiresAt ?? null,
+      ownerUserId: input.ownerUserId,
+    },
+  });
+  return { id: rec.id, apiKey: raw, prefix };
+}
+
+export interface VerifiedApiKey {
+  id: string;
+  name: string;
+  scopes: string[];
+  rateLimitPerMin: number;
+  ownerUserId: string | null;
+}
+
+export async function verifyApiKey(raw: string): Promise<VerifiedApiKey | null> {
+  const value = raw.trim();
+  if (!value.startsWith(KEY_PREFIX)) return null;
+  const rec = await prisma.apiKey.findUnique({ where: { keyHash: sha256Hex(value) } });
+  if (!rec || rec.revokedAt) return null;
+  if (rec.expiresAt && rec.expiresAt.getTime() < Date.now()) return null;
+  return { id: rec.id, name: rec.name, scopes: rec.scopes, rateLimitPerMin: rec.rateLimitPerMin, ownerUserId: rec.ownerUserId };
+}
+
+/** Fixed-window per-minute limiter in Redis. Returns true if within budget. */
+export async function checkApiRateLimit(id: string, perMin: number): Promise<boolean> {
+  const redis = getRedis();
+  const bucket = `dev:rl:${id}:${Math.floor(Date.now() / 60_000)}`;
+  const n = await redis.incr(bucket);
+  if (n === 1) await redis.expire(bucket, 65);
+  return n <= perMin;
+}
+
+export async function touchApiKey(id: string): Promise<void> {
+  await prisma.apiKey
+    .update({ where: { id }, data: { lastUsedAt: new Date(), callCount: { increment: 1 } } })
+    .catch(() => undefined);
+}
+
+export async function listApiKeys(): Promise<
+  Array<{ id: string; name: string; prefix: string; scopes: string[]; rateLimitPerMin: number; callCount: number; lastUsedAt: Date | null; expiresAt: Date | null; revokedAt: Date | null; createdAt: Date }>
+> {
+  return prisma.apiKey.findMany({
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true, name: true, prefix: true, scopes: true, rateLimitPerMin: true, callCount: true,
+      lastUsedAt: true, expiresAt: true, revokedAt: true, createdAt: true,
+    },
+  });
+}
+
+/** Update the scopes of an existing key in place (keeps the same key value). Invalid scopes are dropped. */
+export async function setApiKeyScopes(id: string, scopes: string[]): Promise<void> {
+  const clean = scopes.filter((sc) => (API_SCOPES as readonly string[]).includes(sc));
+  await prisma.apiKey.update({ where: { id }, data: { scopes: clean } });
+}
+
+export async function revokeApiKey(id: string): Promise<void> {
+  await prisma.apiKey.update({ where: { id }, data: { revokedAt: new Date() } });
+}
+
+// ───────────── Self-service (per-user) keys ─────────────
+
+export async function listApiKeysByOwner(ownerUserId: string): Promise<
+  Array<{ id: string; name: string; prefix: string; scopes: string[]; callCount: number; revokedAt: Date | null; createdAt: Date }>
+> {
+  return prisma.apiKey.findMany({
+    where: { ownerUserId },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, name: true, prefix: true, scopes: true, callCount: true, revokedAt: true, createdAt: true },
+  });
+}
+
+/** Revoke a key only if it belongs to this owner. Returns true if revoked. */
+export async function revokeApiKeyOwned(id: string, ownerUserId: string): Promise<boolean> {
+  const res = await prisma.apiKey.updateMany({
+    where: { id, ownerUserId, revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
+  return res.count > 0;
+}
+
+/**
+ * Grant the full scope set to every key a user owns. Older keys were created
+ * before wallet:read/orders:* were included, which surfaces as 403 — and a
+ * prober reports that as "endpoint not found".
+ */
+export async function grantAllScopesToOwner(ownerUserId: string): Promise<{ updated: number; scopes: string[] }> {
+  const scopes = [...API_SCOPES] as string[];
+  const res = await prisma.apiKey.updateMany({
+    where: { ownerUserId, revokedAt: null },
+    data: { scopes },
+  });
+  return { updated: res.count, scopes };
+}
+
+export const DEV_SCOPES = ["catalog:read", "orders:read", "orders:write", "wallet:read"] as const;
+
+/**
+ * Issue the caller's ONE developer key, retiring any earlier one.
+ *
+ * Creating a key used to just add another row — nothing tied a key to its
+ * owner exclusively, so a customer tapping Create twice ended up with two live
+ * keys and no way to tell which was which, and revoking the one they could see
+ * left the other still working. Old keys are revoked in the same transaction,
+ * so there is never a moment where two of a user's keys are valid.
+ */
+export async function regenerateApiKeyForOwner(
+  ownerUserId: string,
+  name = "my key",
+): Promise<CreatedApiKey> {
+  return prisma.$transaction(async (tx) => {
+    await tx.apiKey.updateMany({
+      where: { ownerUserId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    const raw = KEY_PREFIX + randomBytes(32).toString("hex");
+    const rec = await tx.apiKey.create({
+      data: {
+        name: name.slice(0, 120),
+        keyHash: sha256Hex(raw),
+        prefix: raw.slice(0, 16),
+        scopes: [...DEV_SCOPES],
+        rateLimitPerMin: 120,
+        ownerUserId,
+      },
+    });
+    return { id: rec.id, apiKey: raw, prefix: rec.prefix };
+  });
+}
+
+/** The caller's single active key, if any. */
+export async function getActiveApiKeyForOwner(ownerUserId: string): Promise<{ id: string; prefix: string; name: string; callCount: number; lastUsedAt: Date | null } | null> {
+  return prisma.apiKey.findFirst({
+    where: { ownerUserId, revokedAt: null },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, prefix: true, name: true, callCount: true, lastUsedAt: true },
+  });
+}

@@ -1,0 +1,228 @@
+import { cached, getRedis } from "../redis.js";
+import { convertMinor, convertMinorExact } from "../fx.js";
+import { prisma, type Currency, type User } from "@gis/database";
+import { REFERRAL_PREFIX } from "@gis/shared";
+
+export interface TelegramIdentity {
+  telegramId: bigint;
+  firstName?: string;
+  lastName?: string;
+  username?: string;
+  locale?: string;
+  startPayload?: string;
+}
+
+export interface ResolvedUser {
+  user: User & { roleNames: string[] };
+  isNew: boolean;
+}
+
+function defaultCurrencyForLocale(locale?: string): Currency {
+  // India-first default (PRD §6.2); USD for clearly non-Indian locales.
+  if (!locale) return "INR";
+  const l = locale.toLowerCase();
+  return l === "hi" || l.endsWith("-in") || l === "en" ? "INR" : "USD";
+}
+
+/**
+ * Role names for a user, cached briefly.
+ *
+ * This runs in the bot middleware, so it fired a second sequential DB round trip
+ * on EVERY button tap. Roles change approximately never, so a short cache
+ * removes the query from the hot path entirely without any staleness that
+ * matters — and a cache failure just falls through to the query.
+ */
+async function withRoleNames(user: User): Promise<User & { roleNames: string[] }> {
+  const names = await cached(`role:u:${user.id}`, 120, async () => {
+    const roles = await prisma.userRole.findMany({
+      where: { userId: user.id },
+      include: { role: { select: { name: true } } },
+    });
+    return roles.map((r) => r.role.name);
+  }).catch(async () => {
+    const roles = await prisma.userRole.findMany({ where: { userId: user.id }, include: { role: { select: { name: true } } } });
+    return roles.map((r) => r.role.name);
+  });
+  return Object.assign(user, { roleNames: names });
+}
+
+/**
+ * Find-or-create a user from a Telegram update (Bot UX doc §2).
+ * New users get: CUSTOMER role, wallet, immutable first-touch referral attribution.
+ */
+export async function resolveTelegramUser(input: TelegramIdentity): Promise<ResolvedUser> {
+  const existing = await prisma.user.findUnique({ where: { telegramId: input.telegramId } });
+  if (existing) {
+    // `notifiable` is part of this: it is cleared when the bot is blocked, and
+    // somebody sending us an update has plainly unblocked it. Gating the write
+    // on a name change left everyone who ever blocked and came back permanently
+    // cut out of every broadcast. lastName is checked for the same reason — it
+    // was written by the update below but never able to trigger one.
+    const needsUpdate =
+      existing.firstName !== (input.firstName ?? existing.firstName) ||
+      existing.lastName !== (input.lastName ?? existing.lastName) ||
+      existing.telegramHandle !== (input.username ?? existing.telegramHandle) ||
+      !existing.notifiable;
+    const user = needsUpdate
+      ? await prisma.user.update({
+          where: { id: existing.id },
+          data: {
+            firstName: input.firstName ?? existing.firstName,
+            lastName: input.lastName ?? existing.lastName,
+            telegramHandle: input.username ?? existing.telegramHandle,
+            notifiable: true,
+          },
+        })
+      : existing;
+    return { user: await withRoleNames(user), isNew: false };
+  }
+
+  // Referral attribution — first touch, validated, immune to self-referral.
+  let referredById: string | undefined;
+  if (input.startPayload?.startsWith(REFERRAL_PREFIX)) {
+    const code = input.startPayload.slice(REFERRAL_PREFIX.length);
+    const referrer = await prisma.user.findUnique({ where: { referralCode: code } });
+    if (referrer && referrer.telegramId !== input.telegramId) referredById = referrer.id;
+  }
+
+  const currency = "USD" as Currency; // new users default to USD (changeable in menu)
+  const customerRole = await prisma.role.findUnique({ where: { name: "CUSTOMER" } });
+
+  const user = await prisma.user.create({
+    data: {
+      telegramId: input.telegramId,
+      firstName: input.firstName,
+      lastName: input.lastName,
+      telegramHandle: input.username,
+      locale: input.locale ?? "en",
+      currency,
+      referredById,
+      wallet: { create: { currency } },
+      ...(customerRole ? { roles: { create: { roleId: customerRole.id } } } : {}),
+    },
+  });
+
+  await prisma.activityLog.create({
+    data: { userId: user.id, event: "bot.start", meta: { referred: Boolean(referredById) } },
+  });
+
+  return { user: await withRoleNames(user), isNew: true };
+}
+
+export async function setUserLocale(userId: string, locale: string): Promise<void> {
+  await prisma.user.update({ where: { id: userId }, data: { locale } });
+}
+
+/**
+ * Switch a user's currency, converting every balance they hold.
+ *
+ * bnplLimitMinor, bnplOutstandingMinor and the wallet balance are bare numbers
+ * interpreted as "whatever the user's currency currently is". Changing the
+ * currency alone therefore relabelled them without converting: a Rs 50 credit
+ * limit became a $50 one, roughly ninety times larger, and a customer owing
+ * Rs 4,400 would suddenly owe $4,400. The wallet balance moved the same way in
+ * the opposite direction.
+ *
+ * Everything is converted in one transaction so a failure part-way cannot leave
+ * a user with amounts in two different currencies.
+ */
+export async function setUserCurrency(userId: string, currency: Currency): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    const u = await tx.user.findUniqueOrThrow({
+      where: { id: userId },
+      select: { currency: true, bnplLimitMinor: true, bnplOutstandingMinor: true },
+    });
+    if (u.currency === currency) return;
+    const from = u.currency as Currency;
+    const conv = (n: number): number => Math.round(convertMinor(n, from, currency));
+
+    await tx.user.update({
+      where: { id: userId },
+      data: {
+        currency,
+        bnplLimitMinor: conv(u.bnplLimitMinor),
+        bnplOutstandingMinor: conv(u.bnplOutstandingMinor),
+      },
+    });
+
+    // The wallet is the same kind of bare number and must move with it, or a
+    // balance would silently gain or lose value on a currency switch.
+    // Locked: this writes an ABSOLUTE converted balance, so a credit or debit
+    // landing between an unlocked read and the write would simply vanish.
+    const wRows = await tx.$queryRaw<Array<{ id: string; balanceMinor: bigint; currency: Currency }>>`
+      SELECT "id", "balanceMinor", "currency" FROM "Wallet" WHERE "userId" = ${userId} FOR UPDATE`;
+    const w = wRows[0];
+    if (w && w.currency !== currency) {
+      // Rounded DOWN: switching back and forth must never create money.
+      const converted = BigInt(Math.max(0, Math.floor(convertMinorExact(Number(w.balanceMinor), w.currency as Currency, currency))));
+      await tx.wallet.update({ where: { id: w.id }, data: { currency, balanceMinor: converted } });
+      // The conversion goes in the ledger as a pair — the old balance out in
+      // the old currency, the converted one in, in the new — so the ledger
+      // still adds up to the balance. Without it every switch with money in
+      // the wallet tripped the daily "wallet reconciliation mismatch" alert.
+      if (w.balanceMinor !== 0n) {
+        const note = `currency switch ${w.currency}→${currency}`;
+        await tx.walletTransaction.create({ data: { walletId: w.id, type: "ADJUSTMENT", amountMinor: -w.balanceMinor, balanceAfterMinor: 0n, currency: w.currency, referenceNote: note } });
+        await tx.walletTransaction.create({ data: { walletId: w.id, type: "ADJUSTMENT", amountMinor: converted, balanceAfterMinor: converted, currency, referenceNote: note } });
+      }
+    }
+  });
+}
+
+export async function getReferralStats(userId: string): Promise<{
+  invited: number;
+  purchased: number;
+  earnedMinor: bigint;
+}> {
+  const [invited, purchased, rewards, wallet] = await Promise.all([
+    prisma.user.count({ where: { referredById: userId } }),
+    prisma.user.count({ where: { referredById: userId, firstPurchaseAt: { not: null } } }),
+    prisma.referralReward.groupBy({
+      by: ["currency"],
+      where: { referrerId: userId, status: "CREDITED" },
+      _sum: { amountMinor: true },
+    }),
+    prisma.wallet.findUnique({ where: { userId }, select: { currency: true } }),
+  ]);
+  // Rewards are stored in the currency they were paid in; a referrer who
+  // switched INR↔USD has both. Callers print this in the WALLET currency, so
+  // convert each group rather than adding ₹ and $ minor units together.
+  const target: Currency = wallet?.currency ?? "USD";
+  const earned = rewards.reduce((sum, g) => sum + convertMinor(g._sum.amountMinor ?? 0, g.currency, target), 0);
+  return { invited, purchased, earnedMinor: BigInt(earned) };
+}
+
+/**
+ * Once a day, not once an order.
+ *
+ * The nudge was sent after EVERY delivery, so a customer buying five things in
+ * an afternoon got the same "share & earn" pitch five times. That reads as
+ * spam and it trains people to ignore the referral programme entirely. This
+ * returns true only for a user's first delivery of the day.
+ *
+ * Redis with a TTL to the end of the day, so it costs one key per buyer per day
+ * and self-cleans. Failing open would restore the spam, so on a Redis error we
+ * stay quiet instead.
+ */
+export async function shouldSendReferralNudge(userId: string): Promise<boolean> {
+  try {
+    const redis = getRedis();
+    const day = new Date().toISOString().slice(0, 10);
+    const key = `ref:nudged:${day}:${userId}`;
+    const first = await redis.set(key, "1", "EX", 172_800, "NX");
+    return first !== null;
+  } catch {
+    return false;
+  }
+}
+
+/** "Share & earn" nudge shown after a successful purchase (null if not configurable). */
+export function referralNudgeMessage(referralCode: string | null | undefined, botUsername: string | null | undefined): string | null {
+  if (!botUsername || !referralCode) return null;
+  const link = `https://t.me/${botUsername}?start=ref_${referralCode}`;
+  return [
+    "💛 <b>Enjoyed your purchase? Share &amp; earn!</b>",
+    "Invite friends with your personal link and earn wallet rewards when they make their first purchase:",
+    `<code>${link}</code>`,
+  ].join("\n");
+}

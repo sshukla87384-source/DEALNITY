@@ -1,0 +1,1589 @@
+// Dealnity Store — Prisma Schema v1.0 (Phase 4)
+// PostgreSQL 16 · Money = integer minor units (paise/cents) · Soft deletes via deletedAt
+
+generator client {
+  provider = "prisma-client-js"
+  // node:*-alpine ships OpenSSL 3.x (libssl3). Without this, Prisma guesses
+  // openssl-1.1.x, fails to load its engine and reports
+  // "Could not parse schema engine response ... Error load...".
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────── Enums ─────────────────────────
+
+enum Currency {
+  INR
+  USD
+  XTR // Telegram Stars
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum ResellerStatus {
+  PENDING
+  VERIFIED
+  SUSPENDED
+  BANNED
+}
+
+enum ProductType {
+  LICENSE_KEY
+  DIGITAL_ACCOUNT
+  SUBSCRIPTION
+  DOWNLOAD
+  MANUAL_SERVICE
+}
+
+enum FulfillmentMode {
+  AUTOMATIC
+  MANUAL
+}
+
+enum ProductStatus {
+  DRAFT
+  PENDING_APPROVAL // reseller listings
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum InventoryStatus {
+  AVAILABLE
+  RESERVED
+  SOLD
+  EXPIRED
+  DISABLED
+}
+
+enum SubscriptionPlan {
+  MONTHLY
+  QUARTERLY
+  SEMIANNUAL
+  ANNUAL
+  LIFETIME
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  PENDING_RENEWAL
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  PENDING_FULFILLMENT
+  AWAITING_STOCK
+  MANUAL_REVIEW // webhook amount mismatch or fraud flag — never auto-fulfilled
+  COMPLETED
+  PARTIALLY_REFUNDED
+  REFUNDED
+  CANCELLED
+  EXPIRED
+}
+
+enum PaymentProvider {
+  RAZORPAY // UPI / cards / netbanking
+  NOWPAYMENTS // crypto (BTC/ETH/USDT/...)
+  STRIPE // reserved - not enabled (product decision: UPI + crypto only)
+  PAYPAL // reserved
+  TELEGRAM_STARS // reserved
+  WALLET
+  TERMINAL // self-hosted crypto terminal (own seed, unique address per payment)
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  PROCESSED
+  REJECTED
+  FAILED
+}
+
+enum RefundDestination {
+  GATEWAY
+  WALLET
+}
+
+enum WalletTxType {
+  DEPOSIT
+  PURCHASE
+  REFUND
+  CASHBACK
+  REFERRAL_REWARD
+  COMMISSION // credited on hold release (CommissionEntry.releasedAt)
+  WITHDRAWAL
+  ADJUSTMENT
+  REVERSAL
+}
+
+enum WithdrawalStatus {
+  PENDING
+  APPROVED
+  PROCESSED
+  REJECTED
+}
+
+enum CouponType {
+  FIXED
+  PERCENTAGE
+}
+
+enum CouponScope {
+  GLOBAL
+  PRODUCT
+  CATEGORY
+  USER
+}
+
+enum ReferralRewardStatus {
+  PENDING_HOLD
+  CREDITED
+  WITHHELD
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_CUSTOMER
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum TicketCategory {
+  ORDER_ISSUE
+  DELIVERY_ISSUE
+  PAYMENT_ISSUE
+  ACCOUNT
+  OTHER
+}
+
+enum MessageAuthor {
+  CUSTOMER
+  ADMIN
+  SYSTEM
+}
+
+enum NotificationChannel {
+  TELEGRAM
+  EMAIL
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+enum BroadcastStatus {
+  DRAFT
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum TemplateChannel {
+  TELEGRAM
+  EMAIL
+}
+
+enum MediaKind {
+  IMAGE
+  FILE
+  INVOICE
+  IMPORT
+  ATTACHMENT
+}
+
+// ───────────────────────── Identity & Access ─────────────────────────
+
+model User {
+  id             String     @id @default(cuid())
+  telegramId     BigInt?    @unique
+  telegramHandle String?
+  email          String?    @unique
+  emailVerified  Boolean    @default(false)
+  passwordHash   String? // admins/resellers using web panel (argon2id)
+  firstName      String?
+  lastName       String?
+  locale         String     @default("en")
+  currency       Currency   @default(INR)
+  isVip          Boolean    @default(false)
+  status         UserStatus @default(ACTIVE)
+  notifiable     Boolean    @default(true) // false if bot blocked
+  marketingOptIn Boolean    @default(true)
+  twoFactorSecret String? // encrypted; 2FA-ready
+  twoFactorEnabled Boolean  @default(false)
+
+  referralCode   String   @unique @default(cuid())
+  bnplLimitMinor Int      @default(0) // Buy-Now-Pay-Later credit limit (user currency)
+  bnplOutstandingMinor Int @default(0) // current BNPL amount owed
+  referredById   String?
+  referredBy     User?    @relation("Referrals", fields: [referredById], references: [id])
+  referrals      User[]   @relation("Referrals")
+  firstPurchaseAt DateTime?
+
+  roles           UserRole[]
+  wallet          Wallet?
+  resellerProfile ResellerProfile?
+  cart            Cart?
+  orders          Order[]
+  subscriptions   Subscription[]
+  couponUsages    CouponUsage[]
+  referralRewardsEarned ReferralReward[] @relation("Referrer")
+  referralRewardsCaused ReferralReward[] @relation("Referred")
+  tickets         SupportTicket[]
+  ticketsAssigned SupportTicket[] @relation("TicketAssignee")
+  ticketMessages  TicketMessage[]
+  notifications   Notification[]
+  refreshTokens   RefreshToken[]
+  sessions        Session[]
+  auditLogs       AuditLog[]      @relation("AuditActor")
+  activityLogs    ActivityLog[]
+  downloadGrants  DownloadGrant[]
+  withdrawalsReviewed WithdrawalRequest[] @relation("WithdrawalReviewer")
+  refundsReviewed Refund[]        @relation("RefundReviewer")
+  mediaUploaded   Media[]
+  productsApproved Product[]      @relation("ProductApprover")
+  replacementRequests ReplacementRequest[]
+  reviews             Review[]
+  loyaltyGifts        LoyaltyGift[]
+  spinChallenges      SpinChallenge[]
+  productWatches      ProductWatch[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([referredById])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Role {
+  id          String           @id @default(cuid())
+  name        String           @unique // SUPER_ADMIN, ADMIN, SUPPORT, FINANCE, RESELLER, CUSTOMER
+  description String?
+  isSystem    Boolean          @default(false)
+  users       UserRole[]
+  permissions RolePermission[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+}
+
+model Permission {
+  id     String           @id @default(cuid())
+  key    String           @unique // e.g. "orders.refund", "inventory.import"
+  group  String // e.g. "orders"
+  roles  RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+model UserRole {
+  userId    String
+  roleId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  grantedAt DateTime @default(now())
+
+  @@id([userId, roleId])
+  @@index([roleId])
+}
+
+model RefreshToken {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique // sha256 of token
+  familyId   String // rotation family for reuse detection
+  userAgent  String?
+  ip         String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  replacedBy String?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userAgent String?
+  ip        String?
+  lastSeenAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  revokedAt DateTime?
+
+  @@index([userId])
+}
+
+enum PriceChannel {
+  BOTH   // applies to bot direct purchase AND the developer API
+  DIRECT // bot / in-app direct purchase only
+  API    // developer API purchases only
+}
+
+model UserPrice {
+  id          String       @id @default(cuid())
+  userId      String
+  productId   String
+  amountMinor Int          // override price (major units × 100)
+  currency    Currency @default(USD) // the currency amountMinor is expressed in
+  channel     PriceChannel @default(BOTH)
+  /// Survives a sell-out. A temporary override is dropped when the product hits
+  /// zero stock, so the customer goes back to whatever the public price is by
+  /// the time it is restocked; a permanent one stands until an admin removes it.
+  permanent   Boolean      @default(false)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@unique([userId, productId, channel])
+  @@index([userId])
+  /// The sold-out sweep runs every 5 minutes and looks overrides up BY PRODUCT.
+  /// The unique above is led by userId, so it cannot serve that query and every
+  /// tick sequentially scanned the whole override table.
+  @@index([productId])
+}
+
+model PostTarget {
+  id        String   @id @default(cuid())
+  chatId    String   @unique // Telegram group/channel chat id (may be negative)
+  title     String?
+  addedById String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model WalletTopup {
+  id           String   @id @default(cuid())
+  userId       String
+  amountMinor  Int      // amount to credit, in the user's currency
+  currency     Currency
+  binanceAsset String   // "USDT"
+  binanceAmount String  // exact USDT the user must send
+  /// Settling Binance transaction. @unique enforces "one txn credits once"
+  /// in the DATABASE — the read-then-write check alone lost that race.
+  binanceTxnId String?  @unique
+  status       String   @default("PENDING") // PENDING | CREDITED | EXPIRED | CANCELLED
+  creditedAt   DateTime?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  @@index([status, binanceAsset])
+  @@index([userId, createdAt])
+}
+
+model ApiKey {
+  id        String    @id @default(cuid())
+  name      String
+  keyHash   String    @unique
+  prefix    String // shown prefix for identification (e.g. deal_live_1a2b)
+  scopes    String[] // developer scopes: catalog:read, orders:read, analytics:read
+  rateLimitPerMin Int  @default(120)
+  callCount Int        @default(0)
+  ownerUserId String?
+  lastUsedAt DateTime?
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  revokedAt DateTime?
+}
+
+// ───────────────────────── Reseller ─────────────────────────
+
+model ResellerProfile {
+  id               String         @id @default(cuid())
+  userId           String         @unique
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status           ResellerStatus @default(PENDING)
+  displayName      String
+  commissionPct    Int? // basis points override; null = global setting
+  wholesaleTierId  String?
+  wholesaleTier    PriceTier?     @relation(fields: [wholesaleTierId], references: [id])
+  kycDocumentId    String?
+  kycDocument      Media?         @relation(fields: [kycDocumentId], references: [id])
+  kycVerifiedAt    DateTime?
+  holdDays         Int            @default(7)
+  deliveryFailures Int            @default(0)
+  totalSalesMinor  BigInt         @default(0)
+  ratingAvg        Decimal?       @db.Decimal(3, 2)
+  products         Product[]      @relation("ResellerProducts")
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  deletedAt        DateTime?
+
+  @@index([status])
+}
+
+model PriceTier {
+  id        String            @id @default(cuid())
+  name      String            @unique // RETAIL, RESELLER_L1, RESELLER_L2
+  prices    VariantPrice[]
+  resellers ResellerProfile[]
+  createdAt DateTime          @default(now())
+}
+
+// ───────────────────────── Catalog ─────────────────────────
+
+model Category {
+  id        String     @id @default(cuid())
+  name      String
+  slug      String     @unique
+  parentId  String?
+  parent    Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children  Category[] @relation("CategoryTree")
+  emoji     String?
+  sortOrder Int        @default(0)
+  isActive  Boolean    @default(true)
+  products  Product[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  deletedAt DateTime?
+
+  @@index([parentId])
+}
+
+model Product {
+  id              String          @id @default(cuid())
+  slug            String          @unique
+  name            String
+  description     String?
+  type            ProductType
+  status          ProductStatus   @default(DRAFT)
+  categoryId      String
+  category        Category        @relation(fields: [categoryId], references: [id])
+  resellerId      String? // null = platform-owned
+  reseller        ResellerProfile? @relation("ResellerProducts", fields: [resellerId], references: [id])
+  approvedById    String?
+  approvedBy      User?           @relation("ProductApprover", fields: [approvedById], references: [id])
+  approvedAt      DateTime?
+  fulfillmentMode FulfillmentMode @default(AUTOMATIC)
+  sourcingNote    String? // compliance metadata (PRD §3)
+  activationGuide String?
+  imageId         String?
+  image           Media?          @relation(fields: [imageId], references: [id])
+  imageUrl        String? // hosted image URL (upload or paste) shown in bot product card
+  iconEmoji       String? // small emoji/icon shown next to the product name
+  nameHtml        String? // premium-emoji HTML for the product-card title (display only)
+  descriptionHtml String? // premium-emoji HTML for the product-card description (display only)
+  allowPasswordChange Boolean @default(false) // account products: may the buyer change the password?
+  supplierId      String? // if set, this product is fulfilled via an external supplier API
+  supplierRef     String? // external product id at the supplier
+  supplierStock   Int? // last-known supplier stock (null = unknown/unlimited)
+  buyButtonText   String? // custom Buy button label for this product
+  buttonStyle     String? // button colour: success | primary | danger (list + buy)
+  priceLocked     Boolean @default(false) // admin set a custom price — sync won't overwrite it
+  /// True when a PAUSED status came from the supplier being out of stock, rather
+  /// than from the operator hiding it. Sync may unpause the former, never the latter.
+  supplierStockDrivenPause Boolean @default(false)
+  reusableSecretEnc String? // one value delivered to EVERY buyer (shared redemption link) — AES-GCM
+  reusableStock     Int?     // how many times it may still be sold; null = unlimited
+  manualStock       Int?     // optional sellable quantity for MANUAL products; null = unlimited
+  warranty        Boolean @default(false) // does this product come with a replacement warranty?
+  /// Legacy day-granular window. Kept so older rows and the public API keep
+  /// working; `warrantyHours` wins whenever it is set.
+  warrantyDays    Int?    // replacement window in days (null = no time limit while warranty is on)
+  /// Replacement window in HOURS — the source of truth. Day-only products sold
+  /// short-lived accounts as "1 day" because there was nothing smaller.
+  /// null = fall back to warrantyDays; both null = no time limit while warranty is on.
+  warrantyHours   Int?
+  salePercentBp   Int? // flash-sale discount in basis points (1000 = 10% off)
+  saleStartsAt    DateTime?
+  saleEndsAt      DateTime?
+  /// Legacy single tier. Still honoured when bulkTiers is empty, so products
+  /// configured before tiered pricing keep working untouched.
+  bulkMinQty      Int?
+  bulkPercentBp   Int?
+  /// Quantity discount ladder: [{ "minQty": 10, "percentBp": 500 }, ...]
+  bulkTiers       Json?
+  announcedAt     DateTime? // set when auto-announced to bot users (dedupe)
+  isFeatured      Boolean         @default(false)
+  sortOrder       Int             @default(0)
+  pinRank         Int             @default(0) // higher = higher in the shop list; 0 = unpinned
+  variants        ProductVariant[]
+  couponsScoped   Coupon[]        @relation("CouponProducts")
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  deletedAt       DateTime?
+
+  @@index([categoryId, status])
+  @@index([resellerId])
+  @@index([type])
+  @@index([isFeatured, status])
+  @@index([status, deletedAt, pinRank(sort: Desc), sortOrder, createdAt(sort: Desc)])
+  @@index([supplierId, supplierRef])
+}
+
+model ProductVariant {
+  id               String            @id @default(cuid())
+  productId        String
+  product          Product           @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name             String // "3 Months", "Pro Edition"
+  sku              String            @unique
+  fulfillmentMode  FulfillmentMode? // override product default
+  subscriptionPlan SubscriptionPlan?
+  durationDays     Int? // legacy: validity of key/account after delivery, in days
+  /// Validity after delivery in HOURS — the source of truth. Lets a variant be
+  /// a 6-hour trial, not just a whole number of days.
+  /// null = fall back to durationDays; both null = no expiry of our own.
+  durationHours    Int?
+  downloadAssetId  String?
+  downloadAsset    DownloadAsset?    @relation(fields: [downloadAssetId], references: [id])
+  downloadLimit    Int               @default(3)
+  downloadTtlHours Int               @default(24)
+  lowStockThreshold Int              @default(5)
+  /// What YOU pay per unit, in store base currency (USD) minor units. Used as the
+  /// cost when a stock row has no cost of its own, so margin is always knowable.
+  defaultCostMinor Int?
+  isActive         Boolean           @default(true)
+  sortOrder        Int               @default(0)
+  prices           VariantPrice[]
+  licenseKeys      LicenseKey[]
+  digitalAccounts  DigitalAccount[]
+  cartItems        CartItem[]
+  orderItems       OrderItem[]
+  subscriptions    Subscription[]
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  deletedAt        DateTime?
+
+  @@index([productId])
+}
+
+model VariantPrice {
+  id          String    @id @default(cuid())
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  tierId      String
+  tier        PriceTier @relation(fields: [tierId], references: [id])
+  currency    Currency
+  amountMinor Int // paise / cents
+  compareAtMinor Int? // strike-through price
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([variantId, tierId, currency])
+}
+
+// ───────────────────────── Inventory ─────────────────────────
+
+model LicenseKey {
+  id            String          @id @default(cuid())
+  variantId     String
+  variant       ProductVariant  @relation(fields: [variantId], references: [id])
+  keyEncrypted  String // AES-256-GCM
+  keyHash       String // sha256(normalized key) for duplicate detection
+  status        InventoryStatus @default(AVAILABLE)
+  reservedUntil DateTime?
+  expiresAt     DateTime? // key validity from supplier
+  supplier      String?
+  purchaseCostMinor Int?
+  costCurrency  Currency?
+  batchId       String?
+  orderItemId   String?         @unique
+  orderItem     OrderItem?      @relation(fields: [orderItemId], references: [id])
+  soldAt        DateTime?
+  notes         String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  deletedAt     DateTime?
+
+  @@unique([variantId, keyHash])
+  @@index([variantId, status, deletedAt])
+  @@index([status, reservedUntil])
+  @@index([batchId])
+}
+
+model DigitalAccount {
+  id                String          @id @default(cuid())
+  variantId         String
+  variant           ProductVariant  @relation(fields: [variantId], references: [id])
+  usernameEncrypted String
+  usernameHash      String? // sha256 of the username — dedupe / re-list without duplicating
+  passwordEncrypted String
+  twofaEncrypted    String? // optional TOTP secret (paste at 2fa.live) — AES-GCM
+  recoveryEmail     String?
+  totpSecretEncrypted String?
+  status            InventoryStatus @default(AVAILABLE)
+  reservedUntil     DateTime?
+  expiresAt         DateTime?
+  maxSlots          Int             @default(1) // shared-account slots
+  usedSlots         Int             @default(0)
+  supplier          String?
+  purchaseCostMinor Int?
+  costCurrency      Currency?
+  batchId           String?
+  notes             String?
+  assignments       AccountAssignment[]
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  deletedAt         DateTime?
+
+  @@index([variantId, status])
+  @@index([status, reservedUntil])
+  @@index([variantId, usernameHash])
+}
+
+
+model AccountAssignment {
+  id          String         @id @default(cuid())
+  accountId   String
+  account     DigitalAccount @relation(fields: [accountId], references: [id])
+  orderItemId String         @unique
+  orderItem   OrderItem      @relation(fields: [orderItemId], references: [id])
+  slotLabel   String? // "Profile 3"
+  assignedAt  DateTime       @default(now())
+  revokedAt   DateTime?
+
+  @@index([accountId])
+}
+
+model DownloadAsset {
+  id          String   @id @default(cuid())
+  name        String
+  s3Key       String   @unique
+  sizeBytes   BigInt
+  contentType String
+  checksum    String // sha256
+  variants    ProductVariant[]
+  grants      DownloadGrant[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  deletedAt   DateTime?
+}
+
+model DownloadGrant {
+  id           String        @id @default(cuid())
+  assetId      String
+  asset        DownloadAsset @relation(fields: [assetId], references: [id])
+  userId       String
+  user         User          @relation(fields: [userId], references: [id])
+  orderItemId  String        @unique
+  orderItem    OrderItem     @relation(fields: [orderItemId], references: [id])
+  maxDownloads Int
+  usedDownloads Int          @default(0)
+  expiresAt    DateTime
+  createdAt    DateTime      @default(now())
+
+  @@index([userId])
+  @@index([assetId])
+}
+
+// ───────────────────────── Cart & Orders ─────────────────────────
+
+model Cart {
+  id        String     @id @default(cuid())
+  userId    String     @unique
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  couponId  String?
+  coupon    Coupon?    @relation(fields: [couponId], references: [id])
+  items     CartItem[]
+  updatedAt DateTime   @updatedAt
+  createdAt DateTime   @default(now())
+}
+
+model CartItem {
+  id        String         @id @default(cuid())
+  cartId    String
+  cart      Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+  quantity  Int            @default(1)
+  addedAt   DateTime       @default(now())
+
+  @@unique([cartId, variantId])
+}
+
+model Order {
+  /// Set when this order record exists purely to hold a warranty replacement.
+  replacementOfOrderId String?
+  /// When we sent the single "your order is waiting" reminder. Never re-sent.
+  nudgedAt        DateTime?
+  id             String      @id @default(cuid())
+  orderNumber    String      @unique // GIS-2026-000123
+  userId         String
+  user           User        @relation(fields: [userId], references: [id])
+  status         OrderStatus @default(PENDING_PAYMENT)
+  currency       Currency
+  subtotalMinor  Int
+  discountMinor  Int         @default(0)
+  walletUsedMinor Int        @default(0)
+  bnplMinor       Int        @default(0) // amount put on BNPL credit
+  totalMinor     Int // payable via gateway after wallet
+  couponId       String?
+  coupon         Coupon?     @relation(fields: [couponId], references: [id])
+  expiresAt      DateTime? // payment window
+  paidAt         DateTime?
+  completedAt    DateTime?
+  cancelledAt    DateTime?
+  binanceAsset   String? // e.g. "USDT" — asset expected for Binance Pay
+  binanceAmount  String? // exact (unique) amount the customer must send, for matching
+  /// Binance Pay transactionId that settled this order. @unique so one payment
+  /// can never settle two orders, whatever races upstream.
+  binanceTxnId   String? @unique
+  items          OrderItem[]
+  payments       Payment[]
+  refunds        Refund[]
+  invoice        Invoice?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([status, expiresAt])
+  @@index([status, binanceAsset])
+  @@index([paidAt])
+}
+
+model OrderItem {
+  id              String          @id @default(cuid())
+  orderId         String
+  order           Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variantId       String
+  variant         ProductVariant  @relation(fields: [variantId], references: [id])
+  productNameSnap String // snapshot at purchase
+  variantNameSnap String
+  resellerIdSnap  String? // marketplace attribution snapshot
+  quantity        Int             @default(1)
+  unitPriceMinor  Int
+  totalMinor      Int
+  fulfillmentMode FulfillmentMode
+  fulfilledAt     DateTime?
+  /// When the FIRST delivery happened. A replacement does not reset this, so the
+  /// warranty window continues from the original purchase.
+  warrantyStartAt DateTime?
+  /// When what was delivered stops working: the stock item's own expiry when it
+  /// has one, otherwise delivery time plus the variant's validity.
+  ///
+  /// The same value goes into the encrypted payload the customer sees, but that
+  /// is encrypted and therefore unqueryable — nothing could ask "what expires
+  /// this week?", so expiry reminders and renewals had nothing to stand on.
+  /// null = never expires, or delivered before this column existed.
+  expiresAt       DateTime?
+  /// When the "expires soon — renew" reminder went out; null = not yet.
+  renewalRemindedAt DateTime?
+  /// Cost of the unit actually delivered, snapshotted at delivery in USD minor
+  /// units. Snapshotted because supplier costs change and history must not.
+  costMinor       Int?
+  /// Set when this unit was replaced. The original payload below is NOT cleared —
+  /// the customer must always be able to see what they were originally given.
+  replacedAt      DateTime?
+  /// The unit that superseded this one (lives on the replacement order).
+  replacedByItemId String?  @unique
+  replacedBy      OrderItem? @relation("UnitReplacement", fields: [replacedByItemId], references: [id])
+  /// The faulty unit this one replaces. Exactly one of these two is ever set.
+  replaces        OrderItem? @relation("UnitReplacement")
+  deliveryPayloadEncrypted String? // what was sent (key/credentials JSON), AES-GCM
+  licenseKey      LicenseKey?
+  accountAssignment AccountAssignment?
+  downloadGrant   DownloadGrant?
+  subscription    Subscription?
+  commissionEntry CommissionEntry?
+  replacements    ReplacementRequest[]
+  createdAt       DateTime        @default(now())
+
+  /// Every report and the 60s supplier-retry sweep filter on fulfilledAt. Without
+  /// this the sweep sequentially scanned the whole table once a minute, forever.
+  @@index([fulfilledAt, createdAt])
+  @@index([orderId])
+  @@index([variantId])
+  @@index([resellerIdSnap])
+  /// "What expires in the next N days, and has not been replaced?" — the query
+  /// an expiry reminder runs on every tick, so it must not scan the table.
+  @@index([expiresAt, replacedAt])
+}
+
+model Invoice {
+  id            String   @id @default(cuid())
+  orderId       String   @unique
+  order         Order    @relation(fields: [orderId], references: [id])
+  invoiceNumber String   @unique // INV-2026-000123
+  pdfMediaId    String?
+  pdfMedia      Media?   @relation(fields: [pdfMediaId], references: [id])
+  billingName   String?
+  billingEmail  String?
+  gstin         String?
+  taxMinor      Int      @default(0)
+  issuedAt      DateTime @default(now())
+}
+
+// ───────────────────────── Payments ─────────────────────────
+
+model Payment {
+  id              String          @id @default(cuid())
+  orderId         String
+  order           Order           @relation(fields: [orderId], references: [id])
+  provider        PaymentProvider
+  status          PaymentStatus   @default(CREATED)
+  currency        Currency
+  amountMinor     Int
+  providerRef     String? // gateway payment/session id
+  idempotencyKey  String          @unique
+  failureReason   String?
+  capturedAt      DateTime?
+  refunds         Refund[]
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@unique([provider, providerRef])
+  @@index([orderId])
+  @@index([status, createdAt])
+
+  /// Webhooks look up by providerRef ALONE; the composite unique is led by
+  /// `provider`, so it could not be used and every webhook scanned the table.
+  @@index([providerRef])
+}
+
+model WebhookEvent {
+  id         String          @id @default(cuid())
+  provider   PaymentProvider
+  eventId    String // gateway event id
+  eventType  String
+  signature  String?
+  rawBody    Json
+  processedAt DateTime?
+  error      String?
+  createdAt  DateTime        @default(now())
+
+  @@unique([provider, eventId])
+  @@index([processedAt])
+}
+
+model Refund {
+  id            String            @id @default(cuid())
+  orderId       String
+  order         Order             @relation(fields: [orderId], references: [id])
+  paymentId     String?
+  payment       Payment?          @relation(fields: [paymentId], references: [id])
+  status        RefundStatus      @default(REQUESTED)
+  destination   RefundDestination @default(WALLET)
+  amountMinor   Int
+  currency      Currency
+  reason        String?
+  reviewedById  String?
+  reviewedBy    User?             @relation("RefundReviewer", fields: [reviewedById], references: [id])
+  providerRef   String?
+  processedAt   DateTime?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@index([orderId])
+  @@index([status])
+}
+
+// ───────────────────────── Wallet ─────────────────────────
+
+model Wallet {
+  id            String              @id @default(cuid())
+  userId        String              @unique
+  user          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  currency      Currency
+  balanceMinor  BigInt              @default(0) // cached; ledger is source of truth
+  holdMinor     BigInt              @default(0) // reseller commission under hold
+  transactions  WalletTransaction[]
+  withdrawals   WithdrawalRequest[]
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+}
+
+model WalletTransaction {
+  id            String       @id @default(cuid())
+  walletId      String
+  wallet        Wallet       @relation(fields: [walletId], references: [id])
+  type          WalletTxType
+  amountMinor   BigInt // signed
+  balanceAfterMinor BigInt
+  currency      Currency
+  orderId       String?
+  refundId      String?
+  referenceNote String?
+  idempotencyKey String?     @unique
+  actorId       String? // admin who made ADJUSTMENT
+  createdAt     DateTime     @default(now())
+
+  @@index([walletId, createdAt])
+  @@index([type, createdAt])
+  @@index([orderId])
+}
+
+model WithdrawalRequest {
+  id            String           @id @default(cuid())
+  walletId      String
+  wallet        Wallet           @relation(fields: [walletId], references: [id])
+  amountMinor   BigInt
+  currency      Currency
+  method        String // UPI / BANK / PAYPAL
+  destination   Json // account details (encrypted at app layer)
+  status        WithdrawalStatus @default(PENDING)
+  reviewedById  String?
+  reviewedBy    User?            @relation("WithdrawalReviewer", fields: [reviewedById], references: [id])
+  reviewNote    String?
+  processedAt   DateTime?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@index([status, createdAt])
+  @@index([walletId])
+}
+
+model CommissionEntry {
+  id            String    @id @default(cuid())
+  orderItemId   String    @unique
+  orderItem     OrderItem @relation(fields: [orderItemId], references: [id])
+  resellerId    String
+  grossMinor    Int
+  commissionMinor Int // platform's cut
+  netMinor      Int // reseller earning
+  currency      Currency
+  holdUntil     DateTime
+  releasedAt    DateTime?
+  clawedBackAt  DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([resellerId, releasedAt])
+  @@index([holdUntil, releasedAt])
+}
+
+// ───────────────────────── Coupons & Referrals ─────────────────────────
+
+model Coupon {
+  id             String      @id @default(cuid())
+  code           String      @unique
+  type           CouponType
+  scope          CouponScope @default(GLOBAL)
+  valueMinor     Int? // FIXED: amount in minor units
+  valuePct       Int? // PERCENTAGE: basis points (1000 = 10%)
+  maxDiscountMinor Int?
+  currency       Currency? // required for FIXED
+  minCartMinor   Int         @default(0)
+  firstPurchaseOnly Boolean  @default(false)
+  newUserOnly    Boolean     @default(false) // account age < N days (setting)
+  usageLimit     Int? // total
+  perUserLimit   Int         @default(1)
+  usedCount      Int         @default(0)
+  isStackable    Boolean     @default(false)
+  isActive       Boolean     @default(true)
+  startsAt       DateTime?
+  expiresAt      DateTime?
+  allowedUserId  String? // USER scope
+  products       Product[]   @relation("CouponProducts")
+  categoryIds    String[] // CATEGORY scope
+  usages         CouponUsage[]
+  carts          Cart[]
+  orders         Order[]
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  deletedAt      DateTime?
+
+  @@index([isActive, expiresAt])
+}
+
+model CouponUsage {
+  id        String   @id @default(cuid())
+  couponId  String
+  coupon    Coupon   @relation(fields: [couponId], references: [id])
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  orderId   String   @unique
+  discountMinor Int
+  usedAt    DateTime @default(now())
+
+  @@index([couponId, userId])
+}
+
+model ReferralReward {
+  id           String               @id @default(cuid())
+  referrerId   String
+  referrer     User                 @relation("Referrer", fields: [referrerId], references: [id])
+  referredId   String
+  referred     User                 @relation("Referred", fields: [referredId], references: [id])
+  orderId      String               @unique
+  amountMinor  Int
+  currency     Currency
+  status       ReferralRewardStatus @default(PENDING_HOLD)
+  holdUntil    DateTime
+  creditedAt   DateTime?
+  withheldReason String?
+  createdAt    DateTime             @default(now())
+
+  @@index([referrerId, status])
+  @@index([holdUntil, status])
+}
+
+// ───────────────────────── Subscriptions ─────────────────────────
+
+model Subscription {
+  id           String             @id @default(cuid())
+  userId       String
+  user         User               @relation(fields: [userId], references: [id])
+  variantId    String
+  variant      ProductVariant     @relation(fields: [variantId], references: [id])
+  orderItemId  String             @unique
+  orderItem    OrderItem          @relation(fields: [orderItemId], references: [id])
+  plan         SubscriptionPlan
+  status       SubscriptionStatus @default(ACTIVE)
+  activatedAt  DateTime
+  expiresAt    DateTime? // null = LIFETIME
+  autoRenew    Boolean            @default(false)
+  remindersSent Int               @default(0)
+  renewedFromId String?           @unique
+  renewedFrom  Subscription?      @relation("Renewal", fields: [renewedFromId], references: [id])
+  renewedTo    Subscription?      @relation("Renewal")
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@index([userId, status])
+  @@index([status, expiresAt])
+}
+
+// ───────────────────────── Support ─────────────────────────
+
+model SupportTicket {
+  id           String         @id @default(cuid())
+  ticketNumber String         @unique // T-000482
+  userId       String
+  user         User           @relation(fields: [userId], references: [id])
+  category     TicketCategory
+  priority     TicketPriority @default(NORMAL)
+  status       TicketStatus   @default(OPEN)
+  subject      String
+  orderId      String?
+  /// Set when the ticket is about ONE delivered item, so support can issue a
+  /// replacement straight from the ticket.
+  orderItemId  String?
+  assigneeId   String?
+  assignee     User?          @relation("TicketAssignee", fields: [assigneeId], references: [id])
+  firstResponseAt DateTime?
+  resolvedAt   DateTime?
+  closedAt     DateTime?
+  csatScore    Int?
+  messages     TicketMessage[]
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  @@index([status, priority])
+  @@index([userId])
+  @@index([assigneeId, status])
+  @@index([orderItemId])
+}
+
+model TicketMessage {
+  id        String        @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId  String?
+  author    User?         @relation(fields: [authorId], references: [id])
+  authorType MessageAuthor
+  body      String
+  /// Telegram file_id of a screenshot the customer attached.
+  proofFileId String?
+  mediaId   String?
+  media     Media?        @relation(fields: [mediaId], references: [id])
+  createdAt DateTime      @default(now())
+
+  @@index([ticketId, createdAt])
+}
+
+// ───────────────────────── Notifications & Broadcasts ─────────────────────────
+
+model Notification {
+  id        String              @id @default(cuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   NotificationChannel
+  templateKey String?
+  title     String
+  body      String
+  status    NotificationStatus  @default(PENDING)
+  sentAt    DateTime?
+  error     String?
+  meta      Json?
+  createdAt DateTime            @default(now())
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model Broadcast {
+  id           String          @id @default(cuid())
+  title        String
+  body         String
+  mediaId      String?
+  media        Media?          @relation(fields: [mediaId], references: [id])
+  imageUrl     String? // optional hosted image URL sent with the broadcast
+  recurrence   String          @default("none") // none | daily | weekly (auto-repeat)
+  buttonText   String? // optional call-to-action button label
+  buttonUrl    String? // optional call-to-action button URL
+  pin          Boolean         @default(false) // pin the message in each chat
+  segmentQuery Json // segmentation definition
+  status       BroadcastStatus @default(DRAFT)
+  scheduledAt  DateTime?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  totalTargets Int             @default(0)
+  sentCount    Int             @default(0)
+  failedCount  Int             @default(0)
+  createdById  String
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@index([status, scheduledAt])
+}
+
+model CannedReply {
+  id        String   @id @default(cuid())
+  title     String
+  body      String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+}
+
+model ReportJob {
+  id            String   @id @default(cuid())
+  type          String // "sales_csv", "inventory_xlsx", …
+  params        Json
+  status        String   @default("PENDING") // PENDING | RUNNING | DONE | FAILED
+  resultMediaId String?
+  resultMedia   Media?   @relation(fields: [resultMediaId], references: [id])
+  requestedById String
+  error         String?
+  createdAt     DateTime @default(now())
+  completedAt   DateTime?
+
+  @@index([requestedById, createdAt])
+}
+
+model MessageTemplate {
+  id        String          @id @default(cuid())
+  key       String          @unique // "order.delivered", "wallet.deposit.success"
+  channel   TemplateChannel
+  subject   String? // email only
+  body      String // handlebars-style placeholders
+  isActive  Boolean         @default(true)
+  updatedAt DateTime        @updatedAt
+  createdAt DateTime        @default(now())
+}
+
+// ───────────────────────── Platform ─────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id])
+  actorType  String // USER | ADMIN | SYSTEM | API_KEY
+  action     String // "order.refund.approve"
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+}
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event     String // "bot.start", "checkout.begin"
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([event, createdAt])
+}
+
+model Supplier {
+  id         String   @id @default(cuid())
+  name       String
+  baseUrl    String
+  apiKeyEnc  String   // AES-GCM encrypted API key
+  docsConfig Json? // endpoints/auth/field mapping learned from the supplier's own API docs
+  markupBp   Int      @default(2000) // markup in basis points (2000 = +20%)
+  active     Boolean  @default(true)
+  balanceNote String? // last known supplier balance (display only)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Setting {
+  key       String   @id // "payments.razorpay.enabled", "referral.reward_pct"
+  value     Json
+  updatedById String?
+  updatedAt DateTime @updatedAt
+}
+
+model Media {
+  id          String    @id @default(cuid())
+  kind        MediaKind
+  s3Key       String    @unique
+  fileName    String
+  contentType String
+  sizeBytes   BigInt
+  uploadedById String?
+  uploadedBy  User?     @relation(fields: [uploadedById], references: [id])
+  products    Product[]
+  invoices    Invoice[]
+  broadcasts  Broadcast[]
+  ticketMessages TicketMessage[]
+  kycProfiles ResellerProfile[]
+  reportJobs  ReportJob[]
+  createdAt   DateTime  @default(now())
+  deletedAt   DateTime?
+}
+
+model FxRate {
+  id        String   @id @default(cuid())
+  base      Currency
+  quote     Currency
+  rate      Decimal  @db.Decimal(18, 8)
+  fetchedAt DateTime @default(now())
+
+  @@unique([base, quote, fetchedAt])
+  @@index([base, quote, fetchedAt(sort: Desc)])
+}
+
+enum ReplacementStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// A buyer-raised request to replace a faulty delivered item (warranty claim).
+model ReplacementRequest {
+  id          String            @id @default(cuid())
+  orderItemId String
+  orderItem   OrderItem         @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User              @relation(fields: [userId], references: [id])
+  reason      String
+  proofFileId String? // Telegram file_id of the screenshot the buyer submitted
+  status      ReplacementStatus @default(PENDING)
+  adminNote   String?
+  /// Was this covered by warranty, or a goodwill replacement outside it?
+  warrantyCovered Boolean @default(true)
+  /// The ticket this came through, when it was raised out of warranty.
+  ticketId    String?
+  /// The replacement OrderItem that was delivered for this request.
+  replacementOrderItemId String? @unique
+  /// Who approved it (admin Telegram id or user id), for the audit trail.
+  approvedBy  String?
+  reviewedAt  DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([status, createdAt])
+  @@index([userId])
+  @@index([orderItemId])
+}
+
+/// Cache of machine-translated strings so each phrase is paid for once.
+model Translation {
+  id        String   @id @default(cuid())
+  hash      String // sha256 of the source text
+  lang      String // target locale (hi, ar, es, pt, zh…)
+  source    String   @db.Text
+  output    String   @db.Text
+  createdAt DateTime @default(now())
+
+  @@unique([hash, lang])
+  @@index([lang])
+}
+
+/// A customer's review of a delivered order.
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model Review {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  orderId   String?  @unique // one rating per completed order
+  productId String?
+  rating    Int      // 1-5 — written ONLY from the customer's own tap
+  comment   String?  @db.Text // the customer's words; admins cannot edit this
+  status    ReviewStatus @default(PENDING) // nothing is published until approved
+  verifiedPurchase Boolean @default(false)
+  rejectReason String?
+  adminReply   String?  @db.Text
+  reviewedBy   String?
+  reviewedAt   DateTime?
+  createdAt DateTime @default(now())
+  moderation ReviewModeration[]
+
+  @@index([status, createdAt])
+  @@index([productId, status])
+  @@index([userId])
+}
+
+/// Append-only audit trail of every moderation decision.
+model ReviewModeration {
+  id        String   @id @default(cuid())
+  reviewId  String
+  /// Restrict, NOT Cascade: this table is the audit trail. Cascading meant
+  /// deleting the review a decision was about erased the record of the decision
+  /// — exactly the evidence an append-only trail exists to keep. Deleting a
+  /// moderated review now fails loudly; soft-delete or archive it instead.
+  review    Review   @relation(fields: [reviewId], references: [id], onDelete: Restrict)
+  action    String // APPROVED | REJECTED | REPLIED | VERIFIED | REOPENED
+  reason    String?
+  actor     String // which admin
+  createdAt DateTime @default(now())
+
+  @@index([reviewId, createdAt])
+  @@index([createdAt])
+}
+
+enum TestimonialStatus {
+  DRAFT
+  PENDING
+  PUBLISHED
+  ARCHIVED
+}
+
+/// Curated marketing testimonials. Deliberately SEPARATE from `Review`:
+/// testimonials never contribute to the public star average, which is computed
+/// only from approved in-bot reviews tied to real orders.
+model Testimonial {
+  id           String   @id @default(cuid())
+  customerName String
+  company      String?
+  avatarUrl    String? // http(s) URL or Telegram file_id
+  productId    String? // product it refers to
+  productName  String? // free text when not a catalogue product
+  rating       Int // 1-5, shown on the card only — never averaged into store stats
+  body         String   @db.Text
+  /// Where this came from (DM, email, group, screenshot…). Required for
+  /// admin-added entries so every published quote is traceable to real feedback.
+  source       String
+  /// True only when linked to a real completed order — never settable by hand.
+  verifiedOrderId String?
+  status       TestimonialStatus @default(DRAFT)
+  featured     Boolean  @default(false)
+  pinned       Boolean  @default(false)
+  sortOrder    Int      @default(0)
+  locale       String   @default("en")
+  spamScore    Int      @default(0)
+  createdBy    String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([status, pinned, sortOrder])
+  @@index([productId, status])
+  @@index([locale, status])
+}
+
+/// Append-only log of every testimonial action.
+model TestimonialLog {
+  id            String   @id @default(cuid())
+  testimonialId String
+  action        String
+  detail        String?
+  actor         String
+  createdAt     DateTime @default(now())
+
+  @@index([testimonialId, createdAt])
+}
+
+enum GiftStatus {
+  PENDING
+  DELIVERED
+  CANCELLED
+}
+
+/// A gift the admin sends to a customer. The bot only NOTIFIES — delivery is
+/// done by hand from the admin panel and marked here.
+model LoyaltyGift {
+  id          String     @id @default(cuid())
+  userId      String
+  user        User       @relation(fields: [userId], references: [id])
+  title       String
+  detail      String?    @db.Text
+  tierAtGrant String?
+  status      GiftStatus @default(PENDING)
+  createdBy   String
+  deliveredBy String?
+  deliveredAt DateTime?
+  createdAt   DateTime   @default(now())
+
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
+enum ChallengeStatus {
+  ACTIVE
+  COMPLETED
+  EXPIRED
+}
+
+/// A spend challenge drawn from the wheel. Reward is capped at 2% of the target
+/// in code (see spin.service.ts) and paid to the wallet once, idempotently.
+model SpinChallenge {
+  id            String          @id @default(cuid())
+  orderId       String?         @unique // one spin per purchase
+  won           Boolean         @default(false)
+  userId        String
+  user          User            @relation(fields: [userId], references: [id])
+  targetMinor   Int
+  rewardMinor   Int
+  currency      String
+  baselineMinor Int // spend already recorded when the challenge started
+  status        ChallengeStatus @default(ACTIVE)
+  claimedAt     DateTime?
+  expiresAt     DateTime
+  createdAt     DateTime        @default(now())
+
+  @@index([userId, status])
+  @@index([status, expiresAt])
+}
+
+enum WatchType {
+  RESTOCK
+  PRICE_DROP
+}
+
+/// "Notify me" subscriptions: back-in-stock and price-drop alerts.
+model ProductWatch {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  productId  String
+  type       WatchType
+  /// Price when they subscribed, so a drop can be measured against it.
+  basePriceMinor Int?
+  currency   String?
+  notifiedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@unique([userId, productId, type])
+  @@index([productId, type, notifiedAt])
+}
+
+/// A confirmed incoming UPI credit, read from the merchant account.
+/// This is the ONLY proof the bot has that money actually arrived; a UTR typed
+/// by a customer proves nothing on its own.
+model UpiCredit {
+  id          String   @id @default(cuid())
+  /// UPI reference / RRN, normalised to digits. @unique so one credit can only
+  /// ever settle one thing, matching how binanceTxnId works for Binance.
+  utr         String   @unique
+  amountMinor Int
+  currency    Currency @default(INR)
+  /// When the money landed, per the provider.
+  creditedAt  DateTime
+  /// Raw provider payload, for reconciliation when something looks wrong.
+  raw         Json?
+  /// Order this credit settled, once matched.
+  orderId     String?
+  matchedAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([creditedAt])
+  @@index([amountMinor, creditedAt])
+}
+
+/// One payment on the self-hosted crypto terminal: a fresh HD-derived address
+/// per order / top-up, watched on-chain and swept to the operator's payout
+/// wallet once settled. (chain, index) is the derivation slot; index 0 of every
+/// chain is the gas/main address and is never allocated to a payment.
+model TerminalPayment {
+  id              String    @id @default(cuid())
+  kind            String // ORDER | TOPUP
+  refId           String // Order.id or WalletTopup.id
+  userId          String
+  chain           String // usdtbsc | usdttrc20 | usdtmatic | sol | ton | ltc
+  index           Int
+  address         String
+  expectedAmount  String // asset units, decimal string
+  expectedUsd     String
+  receivedAmount  String    @default("0") // confirmed, asset units
+  pendingAmount   String    @default("0") // seen but not yet confirmed
+  status          String    @default("WAITING") // WAITING | CONFIRMING | PARTIAL | PAID | EXPIRED
+  partialNotified String? // last PARTIAL amount the customer was told about
+  txids           String[]
+  sweepStatus     String    @default("NONE") // NONE | PENDING | RETRY | DONE | SKIPPED
+  sweepTxid       String?
+  sweepError      String?
+  sweepAttempts   Int       @default(0)
+  nextSweepAt     DateTime?
+  lastCheckedAt   DateTime?
+  paidAt          DateTime?
+  expiresAt       DateTime
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([chain, index])
+  @@index([status, expiresAt])
+  @@index([sweepStatus, nextSweepAt])
+  @@index([kind, refId])
+  @@index([userId, createdAt])
+}
+
+/// A wallet gift: the sender's balance moves into a code that anyone can
+/// redeem in the bot (deep link t.me/<bot>?start=gift_<code>). Unclaimed codes
+/// are refunded to the sender after `expiresAt`.
+model GiftVoucher {
+  id          String    @id @default(cuid())
+  code        String    @unique
+  senderId    String
+  amountMinor Int
+  currency    Currency
+  note        String?
+  status      String    @default("PENDING") // PENDING | CLAIMED | REFUNDED
+  claimedById String?
+  claimedAt   DateTime?
+  expiresAt   DateTime
+  createdAt   DateTime  @default(now())
+
+  @@index([senderId, createdAt])
+  @@index([status, expiresAt])
+}

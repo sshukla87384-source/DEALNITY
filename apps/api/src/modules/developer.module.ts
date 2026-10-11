@@ -1,0 +1,805 @@
+import { addToCart, checkoutWithWallet, checkoutWithBnpl, getBnplStatus, clearCart, getLedger, resellerDay, getProductView, getRedis, getWallet, listCategories, listProducts, productRating, productRatings, revealOrderDeliveries, toUsdt, usdtRate, UNLIMITED_STOCK } from "@gis/core";
+import { loadConfig } from "@gis/config";
+import { randomUUID } from "node:crypto";
+import { prisma, type Currency } from "@gis/database";
+import { Body, Controller, Get, Header, Module, Param, Post, Query, Req, UseGuards } from "@nestjs/common";
+import { ApiSecurity, ApiTags } from "@nestjs/swagger";
+import { isCoreError } from "@gis/shared";
+import { z } from "zod";
+import { ApiError, forbidden, notFound } from "../common/errors.js";
+import { DeveloperApiGuard, Scopes, type DeveloperRequest } from "../common/developer.guard.js";
+import { Public, SkipEnvelope } from "../common/permissions.decorator.js";
+
+/** Every price the API returns is expressed in USDT. */
+function usdtOf(minor: number | null, currency: Currency): string | null {
+  return minor === null ? null : toUsdt(minor, currency);
+}
+
+/** UNLIMITED_STOCK is an internal sentinel — never leak 9007199254740991 to API clients. */
+function stockOut(n: number): { stock: number | null; stockText: string; unlimited: boolean; inStock: boolean } {
+  // stockText so a naive consumer prints "Unlimited" instead of "None" when
+  // stock is null (not unit-stocked).
+  if (n >= UNLIMITED_STOCK) return { stock: null, stockText: "Unlimited", unlimited: true, inStock: true };
+  return { stock: n, stockText: String(n), unlimited: false, inStock: n > 0 };
+}
+
+/**
+ * The developer API is USDT-only. We therefore price internally in USD, which
+ * maps 1:1 to USDT and — critically — carries NO INR surcharge, so API sellers
+ * always see the true base price. The legacy ?currency= parameter is ignored.
+ */
+function currencyOf(_q?: unknown): Currency {
+  return "USD" as Currency;
+}
+
+/**
+ * Public Developer API (v1) — API-key authenticated, scoped, rate-limited.
+ * Base path: /api/v1/developer   ·   Docs: /api/v1/developer/docs
+ * Auth: send your key as the `X-API-Key` header (or `Authorization: Bearer`).
+ */
+
+/** Placeholder stored under an Idempotency-Key while its order is in flight. */
+const IDEM_PENDING = "__pending__";
+const IDEM_TTL_SEC = 86_400;
+const ORDER_LOCK_SEC = 30;
+
+const purchaseSchema = z.object({
+  variantId: z.string().min(1),
+  quantity: z.number().int().min(1).max(99).optional().default(1),
+  /**
+   * How to pay. The API only ever offered the wallet, so a partner with a Pay
+   * Later limit could use it in the bot and not through their integration.
+   * Defaults to "wallet", so existing clients are unaffected.
+   */
+  payWith: z.enum(["wallet", "bnpl"]).optional().default("wallet"),
+});
+
+/**
+ * What a partner's storefront should print for one delivered item.
+ *
+ * `secret` is kept for compatibility, but a partner that just dumped it showed
+ * their customer `{"product":"…","variant":"Standard","kind":"LICENSE_KEY",
+ * "secret":{"key":"https://…"}}` — the words around the value, not the value.
+ * So every item now also carries `value`: the key or link itself, or
+ * `username|password[|2fa]` for an account, one line per unit. The default
+ * variant ("Standard") is omitted rather than repeated on every line.
+ */
+function apiDeliveryItem(d: { productName: string; variantName: string; payload: { kind: string; key?: string; username?: string; password?: string; twofa?: string; expiresAt?: string }; activationGuide?: string | null }) {
+  const p = d.payload;
+  const values: string[] = [];
+  if (p.key) values.push(...p.key.split(/\r?\n/).map((l) => l.trim()).filter(Boolean));
+  if (p.username || p.password) values.push([p.username ?? "", p.password ?? "", p.twofa ?? ""].filter(Boolean).join("|"));
+  const isDefaultVariant = d.variantName.trim().toLowerCase() === "standard";
+  return {
+    product: d.productName,
+    ...(isDefaultVariant ? {} : { variant: d.variantName }),
+    kind: p.kind,
+    value: values.join("\n"),
+    values,
+    ...(p.expiresAt ? { expiresAt: p.expiresAt } : {}),
+    secret: p as unknown,
+    ...(d.activationGuide ? { activationGuide: d.activationGuide } : {}),
+  };
+}
+
+/** Plain, numbered text a storefront can show as-is: `1.` then the value, product name once. */
+function apiDeliveryText(items: Array<ReturnType<typeof apiDeliveryItem>>): string {
+  const out: string[] = [];
+  let n = 0;
+  let lastProduct = "";
+  for (const it of items) {
+    const label = it.variant ? `${it.product} — ${it.variant}` : it.product;
+    if (label !== lastProduct) { out.push(`${out.length ? "\n" : ""}${label}`); lastProduct = label; }
+    for (const v of it.values) { n += 1; out.push(`${n}.`, v); }
+  }
+  return out.join("\n");
+}
+
+@ApiTags("developer")
+@ApiSecurity("apiKey")
+@Public()
+@UseGuards(DeveloperApiGuard)
+@Controller("developer")
+export class DeveloperController {
+  /** Verify your key and see its scopes. */
+  @Get("ping")
+  ping(@Req() req: DeveloperRequest) {
+    return { ok: true, key: req.apiKey?.name, scopes: req.apiKey?.scopes ?? [] };
+  }
+
+  @Scopes("catalog:read")
+  @Get("categories")
+  async categories() {
+    return listCategories(null);
+  }
+
+  @Scopes("catalog:read")
+  @Get("products")
+  async products(@Query() query: Record<string, string>, @Req() req: DeveloperRequest) {
+    const page = Math.max(1, Number.parseInt(query.page ?? "1", 10) || 1);
+    // The shared default page size is 6 (sized for Telegram buttons) — far too
+    // small for an API consumer, which is why integrations only ever saw 6
+    // products. Default to 100 here, allow up to 200, and support all=true.
+    const wantAll = query.all === "true" || query.all === "1";
+    const limit = Math.min(200, Math.max(1, Number.parseInt(query.limit ?? query.per_page ?? "100", 10) || 100));
+    const currency = currencyOf(query);
+    const baseOpts = {
+      currency,
+      search: query.search,
+      categoryId: query.categoryId,
+      featuredOnly: query.featured === "true",
+      userId: req.apiKey?.ownerUserId ?? undefined,
+      channel: "API" as const,
+      // Partners sync the whole catalogue; a sold-out product must stay in the
+      // feed (with stock 0) rather than disappear from their side.
+      includeSoldOut: true,
+    };
+    let truncated = false;
+    let res = await listProducts({ ...baseOpts, page: wantAll ? 1 : page, pageSize: wantAll ? 200 : limit });
+    if (wantAll && res.pages > 1) {
+      // Walk the remaining pages (hard-capped) so one call returns the catalogue.
+      const items = [...res.items];
+      for (let pg = 2; pg <= Math.min(res.pages, 10); pg++) {
+        const more = await listProducts({ ...baseOpts, page: pg, pageSize: 200 });
+        items.push(...more.items);
+      }
+      truncated = res.pages > 10;
+      res = { ...res, items, page: 1, pages: 1 };
+    }
+    const inStockOnly = query.inStock === "true";
+    const src = query.source; // "own" | "supplier" | undefined (both)
+    const rat = await productRatings(res.items.map((p) => p.id));
+    const items = res.items
+      .filter((p) => (inStockOnly ? p.inStock : true))
+      .filter((p) => (src === "own" ? !p.supplierBacked : src === "supplier" ? p.supplierBacked : true))
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        emoji: p.iconEmoji,
+        // Prices are ALWAYS USDT for API consumers.
+        currency: "USDT",
+        fromPrice: usdtOf(p.fromPriceMinor, currency),
+        fromPriceUsdt: usdtOf(p.fromPriceMinor, currency),
+        nativeCurrency: currency,
+        fromPriceMinor: p.fromPriceMinor,
+        onSale: p.onSale,
+        inStock: p.inStock,
+        // Same shape the detail endpoint publishes. The ratings were already
+        // being fetched here and then thrown away, so the query ran per request
+        // and no consumer ever saw a rating on a list item.
+        rating: (rat.get(p.id)?.count ?? 0) > 0 ? (rat.get(p.id)?.avg ?? null) : null,
+        reviewCount: rat.get(p.id)?.count ?? 0,
+        // true = fulfilled by an upstream supplier; still bought the same way.
+        supplierBacked: p.supplierBacked,
+        // Order with any of these: POST /orders { "variantId": ... }
+        variants: p.variants.map((v) => ({
+          id: v.id,
+          name: v.name,
+          // A consumer that only reads variants[].name would show "Standard".
+          productName: p.name,
+          label: v.name.trim().toLowerCase() === "standard" ? p.name : `${p.name} — ${v.name}`,
+          price: usdtOf(v.priceMinor, currency),
+          priceUsdt: usdtOf(v.priceMinor, currency),
+          currency: "USDT",
+          priceMinor: v.priceMinor,
+          nativeCurrency: currency,
+          ...stockOut(v.stock),
+        })),
+      }));
+    return {
+      items,
+      page: res.page,
+      pages: res.pages,
+      pageSize: wantAll ? items.length : limit,
+      total: res.total,
+      hasMore: wantAll ? items.length < res.total : res.page < res.pages,
+      truncated,
+      currency: "USDT",
+      nativeCurrency: currency,
+      rate: { inrPerUsdt: usdtRate("INR") },
+    };
+  }
+
+  @Scopes("catalog:read")
+  @Get("products/:id")
+  async product(@Param("id") id: string, @Query() query: Record<string, string>, @Req() req: DeveloperRequest) {
+    try {
+      const [p, detailRating] = await Promise.all([
+        getProductView(id, currencyOf(query), req.apiKey?.ownerUserId ?? undefined, "API"),
+        productRating(id),
+      ]);
+      return {
+        id: p.id,
+        name: p.name,
+        description: p.description,
+        emoji: p.iconEmoji,
+        imageUrl: p.imageUrl,
+        currency: "USDT",
+        nativeCurrency: currencyOf(query),
+        type: p.type,
+        onSale: p.onSale,
+        salePercentBp: p.salePercentBp,
+        saleEndsAt: p.saleEndsAt,
+        activationGuide: p.activationGuide,
+        // true = stocked and fulfilled by an upstream supplier, delivered automatically
+        supplierBacked: p.supplierBacked,
+        warranty: p.warranty,
+        warrantyDays: p.warrantyDays,
+        warrantyHours: p.warrantyHours,
+        rating: detailRating.count > 0 ? detailRating.avg : null,
+        reviewCount: detailRating.count,
+        variants: p.variants.map((v) => ({
+          id: v.id,
+          name: v.name,
+          productName: p.name,
+          label: v.name.trim().toLowerCase() === "standard" ? p.name : `${p.name} — ${v.name}`,
+          price: usdtOf(v.priceMinor, currencyOf(query)),
+          priceUsdt: usdtOf(v.priceMinor, currencyOf(query)),
+          originalPriceUsdt: usdtOf(v.originalPriceMinor, currencyOf(query)),
+          currency: "USDT",
+          priceMinor: v.priceMinor,
+          originalPriceMinor: v.originalPriceMinor,
+          ...stockOut(v.stock),
+        })),
+      };
+    } catch {
+      throw notFound("Product");
+    }
+  }
+
+  @Scopes("catalog:read")
+  @Get("products/:id/stock")
+  async stock(@Param("id") id: string, @Query() query: Record<string, string>, @Req() req: DeveloperRequest) {
+    try {
+      const p = await getProductView(id, currencyOf(query), req.apiKey?.ownerUserId ?? undefined, "API");
+      return {
+        productId: p.id,
+        name: p.name,
+        onSale: p.onSale,
+        currency: "USDT",
+        variants: p.variants.map((v) => ({
+          id: v.id, name: v.name,
+          productName: p.name,
+          label: v.name.trim().toLowerCase() === "standard" ? p.name : `${p.name} — ${v.name}`,
+          price: usdtOf(v.priceMinor, currencyOf(query)),
+          priceUsdt: usdtOf(v.priceMinor, currencyOf(query)),
+          currency: "USDT",
+          priceMinor: v.priceMinor,
+          originalPriceMinor: v.originalPriceMinor, ...stockOut(v.stock),
+        })),
+      };
+    } catch {
+      throw notFound("Product");
+    }
+  }
+
+  /** Your recent orders. Probers GET the collection, so this must exist. */
+  @Scopes("orders:read")
+  @Get("orders")
+  async orders(@Query() query: Record<string, string>, @Req() req: DeveloperRequest) {
+    const ownerId = req.apiKey?.ownerUserId ?? null;
+    if (!ownerId) throw forbidden("This API key isn't linked to a user account.");
+    const limit = Math.min(100, Math.max(1, Number.parseInt(query.limit ?? "20", 10) || 20));
+    const rows = await prisma.order.findMany({
+      where: { userId: ownerId },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+      include: { items: { select: { productNameSnap: true, variantNameSnap: true, quantity: true } } },
+    });
+    return {
+      items: rows.map((o) => ({
+        orderNumber: o.orderNumber,
+        status: o.status,
+        total: toUsdt(o.totalMinor, o.currency as Currency),
+        totalUsdt: toUsdt(o.totalMinor, o.currency as Currency),
+        walletUsedUsdt: toUsdt(o.walletUsedMinor ?? 0, o.currency as Currency),
+        currency: "USDT",
+        nativeCurrency: o.currency,
+        totalMinor: o.totalMinor,
+        walletUsedMinor: o.walletUsedMinor,
+        createdAt: o.createdAt,
+        paidAt: o.paidAt,
+        items: o.items.map((i) => ({ product: i.productNameSnap, variant: i.variantNameSnap, quantity: i.quantity })),
+      })),
+      total: rows.length,
+    };
+  }
+
+  @Scopes("orders:read")
+  @Get("orders/:orderNumber")
+  async order(@Param("orderNumber") orderNumber: string, @Req() req: DeveloperRequest) {
+    const ownerId = req.apiKey?.ownerUserId ?? null;
+    // Never fall back to an unscoped lookup: an unlinked key must not be able to
+    // read somebody else's order by guessing its number.
+    if (!ownerId) throw forbidden("This API key isn't linked to a user account.");
+    const o = await prisma.order.findFirst({
+      where: { orderNumber, userId: ownerId },
+      include: { items: { select: { productNameSnap: true, variantNameSnap: true, quantity: true } } },
+    });
+    if (!o) throw notFound("Order");
+    return {
+      orderNumber: o.orderNumber,
+      status: o.status,
+      total: toUsdt(o.totalMinor, o.currency as Currency),
+      totalUsdt: toUsdt(o.totalMinor, o.currency as Currency),
+      currency: "USDT",
+      nativeCurrency: o.currency,
+      totalMinor: o.totalMinor,
+      createdAt: o.createdAt,
+      paidAt: o.paidAt,
+      items: o.items.map((i) => ({ product: i.productNameSnap, variant: i.variantNameSnap, quantity: i.quantity })),
+    };
+  }
+
+  /** Your wallet balance, always expressed in USDT. */
+  @Scopes("wallet:read")
+  @Get("wallet")
+  async wallet(@Req() req: DeveloperRequest) {
+    const userId = req.apiKey?.ownerUserId;
+    if (!userId) throw forbidden("This API key isn't linked to a user account.");
+    const w = await getWallet(userId);
+    const native = Number(w.balanceMinor);
+    const usdt = toUsdt(native, w.currency);
+    return {
+      // Primary, and what integrations should read: always USDT.
+      balance: usdt,
+      balanceUsdt: usdt,
+      currency: "USDT",
+      // The underlying wallet, for reference.
+      nativeBalanceMinor: native,
+      nativeCurrency: w.currency,
+      rate: { inrPerUsdt: usdtRate("INR") },
+    };
+  }
+
+  /**
+   * Your daily statement: spend, what the same goods cost at our public price,
+   * and the benefit your pricing gave you. USDT, like everything else here.
+   *
+   * We do not know your own selling prices, so `benchmarkMarginPct` is measured
+   * against OUR public price. It is a benchmark, not your actual margin.
+   */
+  @Scopes("orders:read")
+  @Get("stats")
+  async stats(@Req() req: DeveloperRequest, @Query("hours") hours?: string) {
+    const userId = req.apiKey?.ownerUserId;
+    if (!userId) throw forbidden("This API key isn't linked to a user account.");
+    const h = Math.max(1, Math.min(720, Number.parseInt(hours ?? "24", 10) || 24));
+    const d = await resellerDay(userId, h);
+    if (!d) {
+      return { windowHours: h, orders: 0, units: 0, spent: "0.00", publicValue: "0.00", benefit: "0.00", benchmarkMarginPct: null, currency: "USDT", topProducts: [], specialRates: [] };
+    }
+    const u = (minor: number): string => toUsdt(minor, d.currency);
+    return {
+      windowHours: h,
+      orders: d.orders,
+      units: d.units,
+      spent: u(d.spentMinor),
+      publicValue: u(d.publicValueMinor),
+      benefit: u(d.benefitMinor),
+      benchmarkMarginPct: d.benchmarkMarginBp === null ? null : Number((d.benchmarkMarginBp / 100).toFixed(2)),
+      benchmarkNote: "Measured against our public price — we cannot see your own selling prices, so this is a benchmark, not your actual margin.",
+      currency: "USDT",
+      topProducts: d.topProducts.map((p) => ({ name: p.name, units: p.units, spent: u(p.spentMinor) })),
+      specialRates: d.deals.map((x) => ({ product: x.name, yourPrice: u(x.yourMinor), publicPrice: u(x.publicMinor), discountPct: Number((x.offBp / 100).toFixed(2)) })),
+    };
+  }
+
+  /** Balance + your recent wallet ledger (last 10 entries). */
+  @Scopes("wallet:read")
+  @Get("balance")
+  async balance(@Req() req: DeveloperRequest) {
+    const userId = req.apiKey?.ownerUserId;
+    if (!userId) throw forbidden("This API key isn't linked to a user account.");
+    const [w, ledger, bnpl] = await Promise.all([
+      getWallet(userId),
+      getLedger(userId, 1, 10),
+      getBnplStatus(userId).catch(() => null),
+    ]);
+    const native = Number(w.balanceMinor);
+    const usdt = toUsdt(native, w.currency);
+    return {
+      // Always USDT — integrations should read `balance` / `balanceUsdt`.
+      balance: usdt,
+      balanceUsdt: usdt,
+      currency: "USDT",
+      nativeBalanceMinor: native,
+      nativeCurrency: w.currency,
+      rate: { inrPerUsdt: usdtRate("INR") },
+      // Pay Later, so an integration can see the credit it may spend with
+      // POST /orders { "payWith": "bnpl" } instead of discovering it by failure.
+      bnpl: bnpl
+        ? {
+            availableUsdt: toUsdt(bnpl.availableMinor, bnpl.currency),
+            limitUsdt: toUsdt(bnpl.limitMinor, bnpl.currency),
+            outstandingUsdt: toUsdt(bnpl.outstandingMinor, bnpl.currency),
+            availableMinor: bnpl.availableMinor,
+            limitMinor: bnpl.limitMinor,
+            outstandingMinor: bnpl.outstandingMinor,
+            nativeCurrency: bnpl.currency,
+          }
+        : null,
+      ledger: ledger.entries.map((e) => ({
+        type: e.type,
+        amountUsdt: toUsdt(Number(e.amountMinor), e.currency),
+        balanceAfterUsdt: toUsdt(Number(e.balanceAfterMinor), e.currency),
+        currency: e.currency,
+        amountMinor: Number(e.amountMinor),
+        balanceAfterMinor: Number(e.balanceAfterMinor),
+        note: e.note,
+        at: e.createdAt,
+      })),
+    };
+  }
+
+  /**
+   * Purchase a variant, paid from your wallet balance. Delivers instantly for
+   * auto-fulfilled products (secrets are returned in the response).
+   * Body: { "variantId": "...", "quantity": 1 }
+   */
+  @Scopes("orders:write")
+  @Post("orders")
+  async purchase(@Body() body: unknown, @Req() req: DeveloperRequest) {
+    const userId = req.apiKey?.ownerUserId;
+    if (!userId) throw forbidden("This API key isn't linked to a user account, so it can't purchase.");
+    const parsed = purchaseSchema.safeParse(body);
+    if (!parsed.success) throw new ApiError(400, "VALIDATION_FAILED", parsed.error.issues[0]?.message ?? "Invalid body.");
+    const { variantId, quantity, payWith } = parsed.data;
+    const idemRaw = req.headers["idempotency-key"];
+    const idem = (Array.isArray(idemRaw) ? idemRaw[0] : idemRaw)?.trim();
+    const idemKey = idem ? `apiidem:${req.apiKey?.id}:${idem}` : null;
+    const redis = getRedis();
+    let idemClaimed = false;
+    if (idemKey) {
+      const prev = await redis.get(idemKey);
+      if (prev && prev !== IDEM_PENDING) {
+        const o = await prisma.order.findFirst({ where: { orderNumber: prev, userId } });
+        if (o) return { orderNumber: o.orderNumber, status: o.status, currency: o.currency, totalMinor: o.totalMinor, replayed: true, items: [] };
+      }
+      // Claim the key BEFORE checking out. Writing it only afterwards left a
+      // whole checkout's worth of time in which a retry of the same request
+      // bought a second order.
+      const claimed = await redis.set(idemKey, IDEM_PENDING, "EX", IDEM_TTL_SEC, "NX");
+      if (claimed !== "OK") {
+        throw new ApiError(409, "IDEMPOTENCY_IN_FLIGHT", "A request with this Idempotency-Key is still being processed. Retry in a moment.");
+      }
+      idemClaimed = true;
+    }
+
+    // The cart is a single shared row per user, so two concurrent API purchases
+    // would interleave clearCart/addToCart and check out each other's items.
+    const lockKey = `apiorder:lock:${userId}`;
+    const lockToken = randomUUID();
+    const locked = await redis.set(lockKey, lockToken, "EX", ORDER_LOCK_SEC, "NX");
+    if (locked !== "OK") {
+      if (idemClaimed && idemKey) await redis.del(idemKey).catch(() => undefined);
+      throw new ApiError(409, "PURCHASE_IN_PROGRESS", "Another purchase for this account is still in progress. Retry in a moment.");
+    }
+    let placed = false;
+    try {
+      await clearCart(userId);
+      await addToCart(userId, variantId, quantity);
+      const r = payWith === "bnpl"
+        ? await checkoutWithBnpl(userId, "API")
+        : await checkoutWithWallet(userId, "API");
+      placed = true;
+      if (idemKey) await redis.set(idemKey, r.orderNumber, "EX", IDEM_TTL_SEC);
+
+      let items = r.deliveries.map((d) => apiDeliveryItem({
+        productName: d.productName,
+        variantName: d.variantName,
+        payload: { kind: d.kind, ...d.secret },
+        activationGuide: d.activationGuide,
+      }));
+      let status: string = r.status;
+      let pending = r.pendingManualItems;
+
+      // Supplier-backed items are fulfilled right after the order transaction
+      // commits, so they are missing from `r.deliveries`. Re-read what was
+      // actually delivered so API clients get their keys in this response.
+      if (pending > 0) {
+        try {
+          // Supplier-backed lines are bought upstream immediately after the order
+          // tx commits; give a slow supplier a moment before reading deliveries.
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const done = await prisma.orderItem.count({ where: { orderId: r.orderId, fulfilledAt: null } });
+            if (done === 0) break;
+            if (attempt < 2) await new Promise((res) => setTimeout(res, 800)); // no sleep after the last check
+          }
+          const delivered = await revealOrderDeliveries(userId, r.orderId);
+          if (delivered.length > items.length) {
+            items = delivered.map((d) => apiDeliveryItem(d));
+            const fresh = await prisma.order.findUnique({ where: { id: r.orderId }, select: { status: true } });
+            if (fresh) status = fresh.status;
+            pending = Math.max(0, pending - (delivered.length - r.deliveries.length));
+          }
+        } catch {
+          // fall back to the transaction-time deliveries
+        }
+      }
+
+      return {
+        orderNumber: r.orderNumber,
+        status,
+        charged: toUsdt(r.totalMinor, r.currency as Currency),
+        chargedUsdt: toUsdt(r.totalMinor, r.currency as Currency),
+        currency: "USDT",
+        nativeCurrency: r.currency,
+        totalMinor: r.totalMinor,
+        pendingManualItems: pending,
+        items,
+        // Ready to display: numbered values, the product named once.
+        deliveryText: apiDeliveryText(items),
+      };
+    } catch (e) {
+      // Only release the claim when no order was actually created, otherwise a
+      // retry after a post-checkout hiccup would buy a second one.
+      if (idemKey && idemClaimed && !placed) await redis.del(idemKey).catch(() => undefined);
+      if (isCoreError(e)) {
+        const status = e.code === "INSUFFICIENT_BALANCE" ? 402 : 400;
+        throw new ApiError(status, e.code, e.message);
+      }
+      throw e;
+    } finally {
+      // Release only our own lock — never one a later request took after ours expired.
+      if ((await redis.get(lockKey).catch(() => null)) === lockToken) {
+        await redis.del(lockKey).catch(() => undefined);
+      }
+    }
+  }
+}
+
+
+function docsPage(): string {
+  const cfg = loadConfig();
+  const base = `${(cfg.PUBLIC_API_URL ?? "").replace(/\/$/, "")}/api/v1/developer`;
+  const store = cfg.STORE_NAME;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>${store} — Developer API</title>
+<style>
+  :root{--bg:#0b0e14;--card:#131824;--line:#232a3a;--fg:#e6e9f0;--mut:#9aa4b2;--acc:#4ade80;--acc2:#38bdf8;--code:#0f1420;}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:900px;margin:0 auto;padding:32px 20px 80px}
+  h1{font-size:28px;margin:0 0 4px}h2{font-size:19px;margin:34px 0 12px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .sub{color:var(--mut);margin:0 0 24px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:12px 0}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  code{background:var(--code);padding:2px 6px;border-radius:6px;color:var(--acc2)}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px;overflow:auto;color:#d7dbe6}
+  .ep{display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}
+  .ep:last-child{border-bottom:0}
+  .m{font-weight:700;font-size:12px;padding:3px 8px;border-radius:6px;min-width:52px;text-align:center}
+  .get{background:rgba(56,189,248,.15);color:var(--acc2)}.post{background:rgba(74,222,128,.15);color:var(--acc)}
+  .path{color:var(--fg)}.desc{color:var(--mut);margin-left:auto;text-align:right;font-size:13px}
+  a{color:var(--acc2)}.pill{display:inline-block;background:rgba(74,222,128,.12);color:var(--acc);border-radius:999px;padding:2px 10px;font-size:12px;margin-left:8px}
+  ul{margin:8px 0;padding-left:20px}li{margin:4px 0;color:var(--mut)}li b{color:var(--fg)}
+</style></head><body><div class="wrap">
+<h1>${store} — Developer API <span class="pill">v1</span></h1>
+<p class="sub">REST API for programmatic catalog access and order placement.</p>
+
+<div class="card"><b>Base URL</b><br/><code>${base}</code><br/><br/>\n<b>Importing this API into another shop?</b> Point your importer at:<br/>\n<code>${base}/docs.txt</code> (plain text) or <code>${base}/manifest</code> (JSON)</div>
+
+<h2>Authentication</h2>
+<div class="card">Send your key on every request (except <code>/health</code>) as a header:
+<pre>Authorization: Bearer YOUR_API_KEY
+# or
+X-API-Key: YOUR_API_KEY</pre>
+Create a key in the bot: open the menu → <b>🧑‍💻 Developer API</b> → <b>Create API key</b>.</div>
+
+<h2>Endpoints</h2>
+<div class="card">
+  <div class="ep"><span class="m get">GET </span><code class="path">/health</code><span class="desc">liveness (no auth)</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/products</code><span class="desc">buyable catalog (incl. variantIds)</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/products?all=true</code><span class="desc">entire catalogue, one call</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/products?limit=200&amp;page=2</code><span class="desc">paged (limit 1-200, default 100)</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/products?inStock=true</code><span class="desc">in-stock only</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/products/{id}</code><span class="desc">one product</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/products/{id}/stock</code><span class="desc">live stock & price</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/categories</code><span class="desc">categories</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/balance</code><span class="desc">balance in USDT + ledger</span></div>
+  <div class="ep"><span class="m post">POST </span><code class="path">/orders</code><span class="desc">place an order</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/orders</code><span class="desc">your recent orders</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/orders/{orderNumber}</code><span class="desc">a single order</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/wallet</code><span class="desc">balance only</span></div>
+  <div class="ep"><span class="m get">GET </span><code class="path">/ping</code><span class="desc">verify key + see its scopes</span></div>
+</div>
+
+<h2>Place an order</h2>
+<div class="card">
+Body:
+<pre>{ "variantId": "VARIANT_ID", "quantity": 2 }</pre>
+Paid from your wallet balance — top up via the bot's <b>💳 Deposit</b> menu. Always send an
+<code>Idempotency-Key</code> header so a retry never double-charges. Delivered codes/credentials are returned in the response on success.
+<pre>curl -X POST "${base}/orders" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" \
+  -d '{"variantId":"VARIANT_ID","quantity":1}'</pre>
+</div>
+
+<h2>Catalog response</h2>
+<div class="card">
+<code>/products</code> returns every buyable variant inline, so you can order straight from the list — no second call needed:
+<pre>{
+  "items": [
+    { "id": "PRODUCT_ID", "name": "Youtube 3M", "currency": "INR",
+      "fromPriceMinor": 15920, "onSale": false, "inStock": true,
+      "variants": [
+        { "id": "VARIANT_ID", "name": "Standard",
+          "priceMinor": 15920, "stock": 42, "unlimited": false, "inStock": true }
+      ] }
+  ], "page": 1, "pages": 3, "total": 54, "currency": "INR"
+}</pre>
+<ul>
+<li><b>variants[].id</b> is what you send as <code>variantId</code> to <code>POST /orders</code>.</li>
+<li><b>USDT only.</b> Every amount in this API — product prices, order totals and your balance — is USDT. There is no currency parameter; the INR handling fee that applies in the bot is NOT applied here, so you always see the true base price.</li>
+<li><b>All prices are USDT.</b> Every product, variant and order returns <code>price</code>/<code>priceUsdt</code> (2dp string) with <code>currency: "USDT"</code>. Raw <code>priceMinor</code> and <code>nativeCurrency</code> are also included for reference.</li>
+<li><b>stock</b> is the real number available. For supplier-backed products this is the upstream supplier stock.</li>
+<li><b>unlimited: true</b> means the item is not unit-stocked (<code>stock</code> is <code>null</code>); it is always orderable. Use <code>stockText</code> if you want a ready-to-display value — it is the number, or <code>"Unlimited"</code>.</li>
+<li>Each variant also carries <code>productName</code> and a display-ready <code>label</code>, so a picker never shows just <code>"Standard"</code>.</li>
+<li>Add <code>?inStock=true</code> to receive only orderable products.</li>
+<li><b>Supplier-backed items are included and fully purchasable</b> — they carry <code>supplierBacked: true</code>, are bought with the same <code>POST /orders</code> call, and their keys come back in that response. Filter with <code>?source=supplier</code> or <code>?source=own</code>.</li>
+<li><b>Getting only a handful of products?</b> Pass <code>?all=true</code> for the whole catalogue in one call, or page with <code>?limit=200&amp;page=N</code>. Default page size is <b>100</b>; the response carries <code>total</code>, <code>pages</code> and <code>hasMore</code>.</li>
+</ul>
+</div>
+
+<h2>Notes</h2>
+<div class="card"><ul>
+<li><b>Supplier-backed products</b> — items flagged <code>supplierBacked: true</code> are stocked upstream and delivered automatically; your keys come back in the <code>POST /orders</code> response just like local stock.</li>
+<li><b>Balance is always USDT</b> — <code>/balance</code> and <code>/wallet</code> return <code>balance</code> / <code>balanceUsdt</code> as a 2dp USDT string with <code>currency: "USDT"</code>, whatever currency the wallet is held in. The underlying values are also included as <code>nativeBalanceMinor</code> / <code>nativeCurrency</code>, plus the <code>inrPerUsdt</code> rate used.</li>
+<li><b>Single balance</b> — API orders are paid from your main wallet; top up via the Deposit menu.</li>
+<li><b>Rate limit</b> — 60 requests/min per key (configurable per key).</li>
+<li>All monetary amounts are integer <b>minor units</b> (e.g. cents); currency is on each response.</li>
+<li>All timestamps are <b>ISO-8601 UTC</b>.</li>
+<li><b>Getting 403 on /balance or /orders?</b> Your key is missing a scope. Call <code>GET /ping</code> — it lists the scopes the key actually has. <code>/balance</code> needs <code>wallet:read</code>, <code>/orders</code> needs <code>orders:read</code>, placing an order needs <code>orders:write</code>. Regenerate the key in the bot (🧑‍💻 Developer API) to get all of them.</li>
+<li><b>Full endpoint paths</b> — every route is under <code>${base}</code>, e.g. balance is <code>${base}/balance</code> (needs the <code>wallet:read</code> scope), not <code>/balance</code> at the domain root.</li>
+<li>Interactive reference: <a href="${base}/docs">${base}/docs</a></li>
+</ul></div>
+
+<h2>Example</h2>
+<div class="card"><pre>curl -H "Authorization: Bearer YOUR_API_KEY" \
+  "${base}/products"</pre></div>
+</div></body></html>`;
+}
+
+/**
+ * The global helmet() CSP is `style-src 'self' https:`, which blocks the inline
+ * <style> block this page is built around — it rendered unstyled. Relax ONLY
+ * style-src, and only on the two HTML doc routes; @Header overwrites the header
+ * helmet set upstream, so the global policy stays strict everywhere else.
+ */
+const DOCS_CSP =
+  "default-src 'self'; base-uri 'self'; font-src 'self' https: data:; form-action 'self'; " +
+  "frame-ancestors 'self'; img-src 'self' data:; object-src 'none'; script-src 'none'; " +
+  "script-src-attr 'none'; style-src 'self' 'unsafe-inline'";
+
+/** Public developer-API docs page + health check (no auth). */
+@ApiTags("developer")
+@Public()
+@Controller("developer")
+export class DeveloperDocsController {
+  @Get("health")
+  health() {
+    return { ok: true, service: "developer-api", ts: new Date().toISOString() };
+  }
+
+  @Get()
+  @SkipEnvelope()
+  @Header("Content-Type", "text/html; charset=utf-8")
+  @Header("Content-Security-Policy", DOCS_CSP)
+  docsRoot(): string {
+    return docsPage();
+  }
+
+  @Get("guide")
+  @SkipEnvelope()
+  @Header("Content-Type", "text/html; charset=utf-8")
+  @Header("Content-Security-Policy", DOCS_CSP)
+  guide(): string {
+    return docsPage();
+  }
+
+  /** Machine-readable integration manifest — importers should use this. */
+  @Get("manifest")
+  manifest() {
+    const base = `${(loadConfig().PUBLIC_API_URL ?? "").replace(/\/$/, "")}/api/v1/developer`;
+    return {
+      name: loadConfig().STORE_NAME,
+      version: "1",
+      base_url: base,
+      auth: { type: "bearer", header: "Authorization", format: "Bearer {API_KEY}", alt_header: "X-API-Key" },
+      endpoints: {
+        products: { method: "GET", path: "/products", query: { all: "true", limit: "1-200", page: "N", inStock: "true", source: "own|supplier" }, note: "all amounts USDT" },
+        product: { method: "GET", path: "/products/{id}" },
+        stock: { method: "GET", path: "/products/{id}/stock" },
+        balance: { method: "GET", path: "/balance", scope: "wallet:read", returns: { balance: "USDT string", currency: "USDT" } },
+        wallet: { method: "GET", path: "/wallet", scope: "wallet:read" },
+        orders_list: { method: "GET", path: "/orders", scope: "orders:read" },
+        order_detail: { method: "GET", path: "/orders/{orderNumber}", scope: "orders:read" },
+        place_order: { method: "POST", path: "/orders", scope: "orders:write", body: { variantId: "string", quantity: "number" }, headers: { "Idempotency-Key": "unique per order" } },
+        ping: { method: "GET", path: "/ping" },
+      },
+      response_fields: {
+        products_list: "items",
+        product_id: "id",
+        variant_id: "variants[].id",
+        price: "variants[].priceUsdt",
+        price_unit: "USDT (2dp string)",
+        price_raw: "variants[].priceMinor",
+        stock: "variants[].stock",
+        stock_text: "variants[].stockText",
+        variant_label: "variants[].label",
+        product_name: "variants[].productName",
+        unlimited_flag: "variants[].unlimited",
+        currency: "currency",
+      },
+      notes: [
+        "USDT ONLY: all prices, balances and order totals are USDT. No currency parameter, and no INR surcharge is applied to API prices.",
+        "priceMinor/nativeCurrency are the underlying values, in integer MINOR units.",
+        "Order using variants[].id as variantId.",
+        "supplierBacked=true items are fulfilled upstream but bought identically.",
+        "A 403 means the key lacks a scope — GET /ping lists the key's scopes.",
+        "Wallet balance is always reported in USDT (balance / balanceUsdt, currency=USDT).",
+      ],
+    };
+  }
+
+  /** Plain-text docs: easiest thing for a scraper or an LLM to read. */
+  @Get("docs.txt")
+  @SkipEnvelope()
+  @Header("Content-Type", "text/plain; charset=utf-8")
+  docsText(): string {
+    const base = `${(loadConfig().PUBLIC_API_URL ?? "").replace(/\/$/, "")}/api/v1/developer`;
+    return [
+      `${loadConfig().STORE_NAME} — Developer API v1`,
+      "",
+      `Base URL: ${base}`,
+      "",
+      "Authentication:",
+      "  Authorization: Bearer YOUR_API_KEY",
+      "  (or) X-API-Key: YOUR_API_KEY",
+      "",
+      "Endpoints:",
+      "  GET /ping",
+      "  GET /products",
+      "  GET /products?all=true",
+      "  GET /products?limit=200&page=1",
+      "  GET /products/{id}",
+      "  GET /products/{id}/stock",
+      "  GET /balance",
+      "  GET /wallet",
+      "  GET /orders",
+      "  GET /orders/{orderNumber}",
+      "  POST /orders",
+      "",
+      'POST /orders body: { "variantId": "VARIANT_ID", "quantity": 1 }',
+      "POST /orders header: Idempotency-Key: <unique-per-order>",
+      "",
+      "Response fields:",
+      '  products list: "items"',
+      '  product id: "id"',
+      '  variant id: "variants[].id"',
+      '  price: "variants[].price" / "variants[].priceUsdt"  (USDT, 2dp string)',
+      '  price (raw): "variants[].priceMinor" + "nativeCurrency"  (integer MINOR units)',
+      '  balance: "balance" / "balanceUsdt"  (USDT, 2dp string; currency is always "USDT")',
+      '  pay later: "bnpl.availableUsdt"  (spend it with POST /orders {"payWith":"bnpl"})',
+      '  delivered value: "items[].value"  (the key / link / user|pass itself — show THIS, not "secret")',
+      '  ready-made text: "deliveryText"  (numbered values, product named once; "variant" is omitted for the default)',
+      '  stock: "variants[].stock"  ("unlimited": true means no limit)',
+      '  stock (display): "variants[].stockText"  (the number, or "Unlimited")',
+      '  variant label: "variants[].label"  (product name, or "Product — Variant")',
+      "",
+      "All amounts are USDT. There is no currency parameter.",
+      "",
+      "Scopes: catalog:read, orders:read, orders:write, wallet:read",
+      "A 403 response means the key is missing a scope; GET /ping lists them.",
+      "",
+      `Machine-readable manifest: ${base}/manifest`,
+      "",
+    ].join("\n");
+  }
+}
+
+@Module({ controllers: [DeveloperDocsController, DeveloperController] })
+export class DeveloperModule {}

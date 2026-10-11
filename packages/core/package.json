@@ -1,0 +1,32 @@
+{
+  "name": "@gis/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "^2.0.2",
+    "@gis/config": "workspace:*",
+    "@gis/database": "workspace:*",
+    "@gis/payments": "workspace:*",
+    "@gis/shared": "workspace:*",
+    "@noble/curves": "^1.7.0",
+    "@noble/hashes": "^1.6.1",
+    "@scure/base": "^1.2.1",
+    "@scure/bip32": "^1.5.0",
+    "@scure/bip39": "^1.4.0",
+    "@scure/btc-signer": "^1.5.0",
+    "@solana/web3.js": "^1.95.4",
+    "@ton/core": "^0.62.0",
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton": "^15.1.0",
+    "bullmq": "^5.34.0",
+    "ioredis": "^5.4.1",
+    "viem": "^2.21.45"
+  }
+}

@@ -1,0 +1,1804 @@
+import {
+  alsoBought,
+  availableCryptoNetworks,
+  binanceOffered,
+  firstOrderAllowed,
+  listFaq,
+  syncComboDiscount,
+  cryptoTerminalReady,
+  upiOffered,
+  listResellerPrices,
+  getUpiAutoPolicy,
+  getUpiProvider,
+  getCartView,
+  getLedger,
+  getProductView,
+  getReferralStats,
+  getWallet,
+  getButtonConfig,
+  getMiniAppConfig,
+  plainDescription,
+  richDescription,
+  miniAppReachableUrl,
+  milestoneProgress,
+  referralEarnings,
+  getCartCoupon,
+  convertMinor,
+  getBnplStatus,
+  getReferralConfig,
+  listCategories,
+  listOrders,
+  listOrderItems,
+  listProducts,
+  listApiKeysByOwner,
+  listTickets,
+  getMyTicket,
+  listUnitsForOrder,
+  listCategoryTiles,
+  categoryIdsUnder,
+  generateTotp,
+  type ReplaceableItem,
+  listVault,
+  listReplaceableItems,
+  productRating,
+  publishedTestimonials,
+  isWatching,
+  listWatches,
+  todaysDeals,
+  searchMyKeys,
+  tierOf,
+  getTiers,
+  getSpinConfig,
+  activeChallenge,
+  storeRating,
+  productRatings,
+  greetName,
+  toUsdt,
+  type CartView,
+  stripLeadingEmoji,
+} from "@gis/core";
+import { prisma, type Currency } from "@gis/database";
+import { loadConfig } from "@gis/config";
+import { PROVIDER_LABELS, listEnabledProviders } from "@gis/payments";
+import { cb, decryptSecret, formatDuration } from "@gis/shared";
+import { InlineKeyboard } from "grammy";
+import type { BotUser } from "./ctx.js";
+import { backToMenuRow, navRow, escapeHtml, fmt, mainMenuKeyboard, mainMenuText, paginationRow } from "./ui.js";
+import { LOCALES, t } from "./i18n.js";
+import { header, bold, num, HR, e } from "./premium.js";
+import { iconId, networkIconId } from "./emoji.js";
+import { sbtn } from "./keyboard.js";
+
+/**
+ * Shorten by characters, not UTF-16 units: `.slice()` could cut an emoji in
+ * half and leave a broken glyph (or an invalid string Telegram rejects) at the
+ * end of a button label.
+ */
+const clip = (text: string, max: number): string => {
+  const chars = Array.from(text);
+  return chars.length <= max ? text : chars.slice(0, max).join("");
+};
+
+/**
+ * A product label with its emoji shown exactly ONCE.
+ *
+ * The emoji can live in two places — the icon field and the front of the name —
+ * and the buttons used to print both, so a product the operator gave one emoji
+ * came out as "🈲🎬 Youtube 3 Months". When an icon is set it wins and the name's
+ * own leading emoji is dropped; with no icon the name keeps whatever it has.
+ */
+function withIcon(iconEmoji: string | null | undefined, name: string, iconCustomEmojiId?: string | null): string {
+  // A premium icon is drawn by Telegram in front of the label, so the label
+  // must carry NO emoji of its own — neither the icon field nor the one at the
+  // front of the name. That pairing ("🈲" from the icon id, "🎬" from the name)
+  // is the double emoji that survived the first fix.
+  if (iconCustomEmojiId) return stripLeadingEmoji(name);
+  return iconEmoji ? `${iconEmoji} ${stripLeadingEmoji(name)}` : name;
+}
+
+export interface View {
+  text: string;
+  kb: InlineKeyboard;
+  photo?: string; // optional image URL → product card / broadcast image
+}
+
+export async function menuView(user: BotUser): Promise<View> {
+  // getButtonConfig was a separate sequential round trip on the most-rendered
+  // screen in the bot.
+  const [wallet, orderCount, btnCfg, miniCfg] = await Promise.all([
+    getWallet(user.id),
+    prisma.order.count({ where: { userId: user.id } }),
+    getButtonConfig(),
+    getMiniAppConfig(),
+  ]);
+  const miniApp = miniCfg.enabled ? await miniAppReachableUrl() : null;
+  return { text: mainMenuText(user, wallet.balanceMinor, orderCount), kb: mainMenuKeyboard(user, btnCfg, miniApp) };
+}
+
+
+/** "Name (29)" · "❌ Name (0)" · "Name (∞)" — matches the stock-list style. */
+function stockTag(p: { inStock: boolean; stock: number | null }): string {
+  if (p.stock === null) return " (∞)";
+  return ` (${p.stock})`;
+}
+function outMark(p: { inStock: boolean }): string {
+  return p.inStock ? "" : "❌ ";
+}
+
+/** The sold-out shelf: what is not for sale right now, with a way to be notified. */
+export async function soldOutView(user: BotUser, page: number): Promise<View> {
+  const result = await listProducts({ currency: user.currency as Currency, page, pageSize: 20, userId: user.id, locale: user.locale, soldOutOnly: true });
+  const kb = new InlineKeyboard();
+  for (const p of result.items) {
+    kb.add(sbtn(withIcon(p.iconEmoji, p.name, p.iconCustomEmojiId), cb("shp", "prod", p.id), "danger", p.iconCustomEmojiId ?? undefined)).row();
+  }
+  paginationRow(kb, "shp", "soldout", result.page, result.pages);
+  kb.row().text("🛍 Back to shop", cb("shp", "home", 1));
+  backToMenuRow(kb);
+  return {
+    text: result.items.length > 0
+      ? "😴 <b>Sold out right now</b>\n<i>Open one and tap 🔔 Notify me — you'll get a message the moment it is back.</i>"
+      : "🎉 Nothing is sold out — everything in the shop is available.",
+    kb,
+  };
+}
+
+export async function shopHomeView(user: BotUser, page: number): Promise<View> {
+  const result = await listProducts({ currency: user.currency as Currency, page, pageSize: 20, userId: user.id, locale: user.locale });
+  const kb = new InlineKeyboard();
+  for (const p of result.items) {
+    const price = p.fromPriceMinor === null ? "—" : fmt(p.fromPriceMinor, user.currency);
+    const sale = p.onSale ? "🔥 " : "";
+    const label = `${sale}${outMark(p)}${withIcon(p.iconEmoji, p.name, p.iconCustomEmojiId)} — ${price}${stockTag(p)}`;
+    kb.add(sbtn(label, cb("shp", "prod", p.id), p.inStock ? ((p.buttonStyle as "primary" | "success" | "danger" | null) ?? "success") : "danger", p.iconCustomEmojiId ?? undefined)).row();
+  }
+  paginationRow(kb, "shp", "home", result.page, result.pages);
+  kb.row().add(sbtn("🔍 Search products", cb("shp", "find"), "primary")).row();
+  // "😴 Sold out (N)" and "📂 All Categories" were removed from this screen at
+  // the operator's request. Both destinations still exist — sold-out items
+  // are reachable through search and the category grid from the main menu —
+  // so the handlers stay; only the two rows here are gone.
+  backToMenuRow(kb);
+  return {
+    text: result.items.length > 0
+      ? "🛍 <b>All Products</b>\n<i>How to buy: tap a product → choose quantity → pay from your 💰 wallet. Delivery is instant for automatic items.</i>"
+      : "🛍 The shop is being restocked — check back soon!",
+    kb,
+  };
+}
+
+export async function categoriesView(parentId: string | null): Promise<View> {
+  const cats = await listCategories(parentId);
+  const kb = new InlineKeyboard();
+  for (const c of cats) {
+    kb.text(`${c.emoji ?? "📂"} ${c.name}`, cb("shp", c.hasChildren ? "sub" : "cat", c.id, 1)).row();
+  }
+  if (parentId) kb.text("◀️ Back", cb("shp", "root"));
+  backToMenuRow(kb);
+  return { text: "📂 <b>Categories</b>", kb };
+}
+
+export async function productListView(
+  user: BotUser,
+  categoryId: string,
+  page: number,
+): Promise<View> {
+  const result = await listProducts({ categoryId, currency: user.currency as Currency, page, userId: user.id, locale: user.locale });
+  const kb = new InlineKeyboard();
+  for (const p of result.items) {
+    const price = p.fromPriceMinor === null ? "—" : fmt(p.fromPriceMinor, user.currency);
+    const sale = p.onSale ? "🔥 " : "";
+    kb.add(sbtn(`${sale}${outMark(p)}${withIcon(p.iconEmoji, p.name, p.iconCustomEmojiId)} — ${price}${stockTag(p)}`, cb("shp", "prod", p.id), p.inStock ? ((p.buttonStyle as "primary" | "success" | "danger" | null) ?? "success") : "danger", p.iconCustomEmojiId ?? undefined)).row();
+  }
+  paginationRow(kb, "shp", "cat", page, result.pages, categoryId);
+  kb.row().add(sbtn("🔍 Search products", cb("shp", "find"), "primary")).row();
+  kb.text("◀️ Categories", cb("shp", "root"));
+  backToMenuRow(kb);
+  return { text: result.total > 0 ? "🛍 <b>Products</b>" : "No products here yet.", kb };
+}
+
+export async function searchResultsView(user: BotUser, query: string, page: number): Promise<View> {
+  const result = await listProducts({ search: query, currency: user.currency as Currency, page, userId: user.id, locale: user.locale });
+  const kb = new InlineKeyboard();
+  for (const p of result.items) {
+    const price = p.fromPriceMinor === null ? "—" : fmt(p.fromPriceMinor, user.currency);
+    const sale = p.onSale ? "🔥 " : "";
+    kb.add(sbtn(`${sale}${outMark(p)}${withIcon(p.iconEmoji, p.name, p.iconCustomEmojiId)} — ${price}${stockTag(p)}`, cb("shp", "prod", p.id), p.inStock ? ((p.buttonStyle as "primary" | "success" | "danger" | null) ?? "success") : "danger", p.iconCustomEmojiId ?? undefined)).row();
+  }
+  paginationRow(kb, "src", "pg", page, result.pages);
+  kb.row().add(sbtn("🔍 Search again", cb("shp", "find"), "primary")).row();
+  kb.text("🛍 All products", cb("shp", "home", 1));
+  backToMenuRow(kb);
+  return {
+    text:
+      result.total > 0
+        ? `🔍 Results for “${escapeHtml(query)}” (${result.total})`
+        : `🔍 Nothing found for “${escapeHtml(query)}”. Try a different name.`,
+    kb,
+  };
+}
+
+function timeLeft(until: Date): string {
+  let ms = until.getTime() - Date.now();
+  if (ms <= 0) return "ending now";
+  const d = Math.floor(ms / 86_400_000); ms -= d * 86_400_000;
+  const h = Math.floor(ms / 3_600_000); ms -= h * 3_600_000;
+  const m = Math.floor(ms / 60_000);
+  if (d > 0) return `${d}d ${h}h left`;
+  if (h > 0) return `${h}h ${m}m left`;
+  return `${m}m left`;
+}
+
+export async function productView(user: BotUser, productId: string): Promise<View> {
+  const [p, rating, store, quotes, watchingStock, watchingPrice] = await Promise.all([
+    getProductView(productId, user.currency as Currency, user.id, "DIRECT", user.locale),
+    productRating(productId),
+    storeRating(),
+    publishedTestimonials({ productId, limit: 2 }),
+    isWatching(user.id, productId, "RESTOCK"),
+    isWatching(user.id, productId, "PRICE_DROP"),
+  ]);
+  // When the text was machine-translated, show the translated plain text rather
+  // than the stored premium-emoji HTML (which is still the original language).
+  const translated = (user.locale ?? "en") !== "en";
+  const UNLIMITED = 1_000_000;
+  const priced = p.variants.filter((v) => v.priceMinor !== null);
+  const cheapest = priced.reduce<{ now: number; was: number | null } | null>((acc, v) => {
+    if (v.priceMinor === null) return acc;
+    if (!acc || v.priceMinor < acc.now) return { now: v.priceMinor, was: v.originalPriceMinor };
+    return acc;
+  }, null);
+  const priceStr = cheapest
+    ? cheapest.was !== null
+      ? `${fmt(cheapest.was, user.currency)} ➜ <b>${fmt(cheapest.now, user.currency)}</b>`
+      : `<b>${fmt(cheapest.now, user.currency)}</b>`
+    : "—";
+  const totalStock = priced.reduce((sum, v) => sum + (v.stock >= UNLIMITED ? 0 : v.stock), 0);
+  const anyStock = priced.some((v) => v.stock >= UNLIMITED || v.stock > 0);
+  // The card follows the layout customers know from other shops: name, price,
+  // the description as a bordered quote with a tick per line, stock, and one
+  // line saying how delivery works. The old card led with a banner and a
+  // "price can change" warning and left the description last and unstyled.
+  const titleHtml = translated ? escapeHtml(p.name) : (p.nameHtml ?? escapeHtml(p.name));
+  const title = p.iconEmoji ? `${p.iconEmoji} ${stripLeadingEmoji(titleHtml)}` : titleHtml;
+  const perUnit = p.type === "LICENSE_KEY" ? " / code" : p.type === "DIGITAL_ACCOUNT" ? " / account" : "";
+  // Description → one quote block. A line the operator did not mark gets a ✅;
+  // lines they marked themselves (✅ ⛔ ❌ ⚠️ …) are left exactly as written.
+  // A description copied from another bot or imported from a supplier often
+  // carries its markup as text (<blockquote><tg-emoji …>); it is cleaned to the
+  // tags Telegram accepts instead of being escaped and printed literally. Our
+  // own quote wraps it, so a quote inside it is dropped (Telegram rejects nesting).
+  const descRaw = translated
+    ? escapeHtml(plainDescription(p.description, null))
+    : richDescription(p.description, p.descriptionHtml, { dropTags: ["blockquote"] });
+  const descLines = descRaw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const marked = /^(?:<[^>]+>)*\s*[\p{Extended_Pictographic}]/u;
+  const anyMarked = descLines.some((l) => marked.test(l));
+  const descBlock = descLines.length > 0
+    ? `<blockquote>${descLines.map((l) => (anyMarked || marked.test(l) ? l : `✅ ${l}`)).join("\n")}</blockquote>`
+    : "";
+  const stockLine = priced.some((v) => v.stock >= UNLIMITED)
+    ? "📊 <b>Stock:</b> Available"
+    : anyStock
+      ? `📊 <b>Stock:</b> ${num(totalStock)} available`
+      : "📊 <b>Stock:</b> ❌ Sold out";
+  const lines = [
+    ...(p.onSale ? ["🔥 <b>FLASH SALE</b> — this price will not last.", ""] : !anyStock ? ["🔔 <b>RESTOCKING SOON</b>", ""] : []),
+    `<b>${title}</b>`,
+    "",
+    `💲 <b>Price:</b> ${priceStr}${perUnit}`,
+    // Advertised from the same helper the charge uses, so it cannot drift from
+    // what the customer is actually billed.
+    ...(p.bulkLadder.length > 0
+      ? [`📦 <b>Bulk:</b> ` + p.bulkLadder.map((t) => `${t.minQty}+ → <b>${fmt(t.unitPriceMinor, user.currency)}</b>`).join(" · ")]
+      : []),
+    ...(descBlock ? ["", descBlock] : []),
+    "",
+    stockLine,
+    ...(totalStock > 0 && totalStock <= 5 && !p.onSale ? ["⚡ <i>Selling fast — only a few left.</i>"] : []),
+    "",
+    (p.fulfillmentMode === "AUTOMATIC" || p.supplierBacked)
+      ? "⚡ Delivery is automatic after payment confirmation."
+      : "🕐 Delivered by our team after payment (~12 h).",
+    // Warranty shown exactly as the admin set it, with the day count.
+    p.warranty
+      ? (p.warrantyDays
+          ? `🛡 <b>${p.warrantyDays}-day replacement warranty</b>`
+          : "🛡 <b>Replacement warranty included</b>")
+      : "🏷 <i>As-is — no replacement warranty.</i>",
+    // Real rating from visible reviews. Hidden under 3 so one early review
+    // cannot define a product — the store rating is shown instead.
+    rating.count >= 3
+      ? `${rating.stars} <b>${rating.avg.toFixed(1)}</b>/5 · <i>${num(rating.count)} review${rating.count === 1 ? "" : "s"}</i>`
+      : store.count >= 3
+        ? `${store.stars} <b>${store.avg.toFixed(1)}</b>/5 store rating · <i>${num(store.count)} reviews</i>`
+        : "",
+    p.isPlatform ? "" : "🏪 Verified Reseller",
+    // A personal price the admin set for THIS customer.
+    ...(p.hasCustomPrice
+      ? ["", `💎 <b>Special price just for you, ${greetName(user)}!</b>`]
+      : user.isVip
+        ? ["", `${e("vip")} <b>VIP price applied</b>`]
+        : []),
+    // Out of stock is a waiting message, not a dead end.
+    ...(!anyStock
+      ? ["",
+         "This one sold out fast! 🔥 Fresh stock is on the way — usually within a few hours.",
+         watchingStock
+           ? "🔔 <b>You're on the list</b> — we'll message you the moment it lands."
+           : "🔔 Tap <b>Notify me</b> below and you'll hear first."]
+      : []),
+    // Curated testimonials — clearly labelled, and never part of the star average.
+    ...(quotes.length > 0
+      ? ["", `💬 <b>What customers say</b>`,
+          ...quotes.flatMap((q) => [
+            `<blockquote>${"⭐".repeat(q.rating)} <i>${escapeHtml(clip(q.body, 220))}</i>\n— <b>${escapeHtml(q.customerName)}</b>${q.company ? `, ${escapeHtml(q.company)}` : ""}${q.verified ? " · ✅ verified purchase" : ""}</blockquote>`,
+          ])]
+      : []),
+  ].filter((l) => l !== "");
+
+  const icon = p.iconEmoji ? `${p.iconEmoji} ` : "";
+  const kb = new InlineKeyboard();
+  for (const v of p.variants) {
+    if (v.stock > 0 && v.priceMinor !== null) {
+      const priceLabel =
+        v.originalPriceMinor !== null
+          ? `${fmt(v.originalPriceMinor, user.currency)} ➜ ${fmt(v.priceMinor, user.currency)}`
+          : fmt(v.priceMinor, user.currency);
+      // Direct buy: tapping asks the quantity, then goes straight to payment.
+      const bl = v.name.trim().toLowerCase() === "standard" ? "" : ` ${v.name}`;
+      const buyLabel = p.buyButtonText ? `${p.buyButtonText} — ${priceLabel}` : `⚡ ${icon}Buy${bl} — ${priceLabel}`;
+      const buyStyle = (p.buttonStyle as "primary" | "success" | "danger" | null) ?? "success";
+      kb.add(sbtn(buyLabel, cb("crt", "buynow", v.id), buyStyle, p.iconCustomEmojiId ?? undefined)).row();
+    } else {
+      const bl = v.name.trim().toLowerCase() === "standard" ? "this" : v.name;
+      kb.add(sbtn(`❌ ${bl} — out of stock`, cb("mnu", "noop"), "danger")).row();
+    }
+  }
+  // Notify-me options: restock when sold out, price drop always.
+  if (!anyStock) {
+    kb.add(sbtn(watchingStock ? "🔔 On the list — stop notifying" : "🔔 Notify me when back in stock", cb("wch", watchingStock ? "offr" : "onr", productId), watchingStock ? "primary" : "success")).row();
+  }
+  kb.add(sbtn(watchingPrice ? "📉 Watching price — stop" : "📉 Tell me if the price drops", cb("wch", watchingPrice ? "offp" : "onp", productId), "primary")).row();
+  navRow(kb, cb("shp", "home", 1));
+  return { text: lines.join("\n"), kb, photo: p.imageUrl || undefined };
+}
+
+export function cartText(view: CartView): string {
+  if (view.lines.length === 0) return "🛒 Your cart is empty.";
+  const rows = view.lines.map((l, i) => {
+    const price = l.lineTotalMinor === null ? "—" : fmt(l.lineTotalMinor, view.currency);
+    const warn = l.available ? "" : " ⚠️ unavailable";
+    const vn = l.variantName.trim().toLowerCase() === "standard" ? "" : ` · ${escapeHtml(l.variantName)}`;
+    return `${i + 1}. ${escapeHtml(l.productName)}${vn} ×${l.quantity} — ${price}${warn}`;
+  });
+  return ["🛒 <b>Cart</b>", "", ...rows, "", `Subtotal: <b>${fmt(view.subtotalMinor, view.currency)}</b>`].join("\n");
+}
+
+export async function cartViewKb(user: BotUser): Promise<View> {
+  const view = await getCartView(user.id, user.currency as Currency);
+  const kb = new InlineKeyboard();
+  for (const l of view.lines) {
+    kb.text("➖", cb("crt", "dec", l.itemId))
+      .text(`${l.quantity} × ${clip(l.productName, 18)}`, cb("mnu", "noop"))
+      .text("➕", cb("crt", "inc", l.itemId))
+      .text("🗑", cb("crt", "del", l.itemId))
+      .row();
+  }
+  if (view.lines.length > 0) {
+    kb.text("🧹 Clear", cb("crt", "clear")).text("✅ Checkout", cb("crt", "checkout")).row();
+  } else {
+    kb.text("🛍 Go shopping", cb("shp", "home", 1)).row();
+  }
+  navRow(kb, cb("shp", "home", 1));
+  return { text: cartText(view), kb };
+}
+
+export async function checkoutSummaryView(user: BotUser): Promise<View> {
+  // The combo discount is applied (or lifted) before the coupon is read, so
+  // the summary describes what will actually be charged.
+  const combo = await syncComboDiscount(user.id, user.currency as Currency).catch(() => ({ applied: false, pct: 0, need: 0, distinct: 0 }));
+  const [view, wallet, coupon, bnpl] = await Promise.all([
+    getCartView(user.id, user.currency as Currency),
+    getWallet(user.id),
+    getCartCoupon(user.id, user.currency as Currency),
+    getBnplStatus(user.id),
+  ]);
+  const discount = coupon?.discountMinor ?? 0;
+  const payable = Math.max(0, view.subtotalMinor - discount);
+  const cryptoReady = await cryptoTerminalReady().catch(() => false);
+  // Manual rails are switched from the admin panel; UPI can also be capped by
+  // order value (big tickets go to the self-verifying rails).
+  const binanceOn = await binanceOffered().catch(() => false);
+  type UpiGate = Awaited<ReturnType<typeof upiOffered>>;
+  const upi: UpiGate = (user.currency as string) === "INR" ? await upiOffered(payable).catch((): UpiGate => ({ ok: false })) : { ok: false };
+  const upiOn = upi.ok;
+  // With the in-bot crypto terminal live, the hosted NOWPayments invoice page is
+  // offered inside the network picker ("other coins") rather than as a second,
+  // confusingly similar crypto button here.
+  const gateways = listEnabledProviders(user.currency).filter((p) => !(cryptoReady && p.id === "nowpayments"));
+
+  // The wallet is charged in ITS OWN currency, which may differ from the
+  // currency the customer browses in. Everything below compares wallet-currency
+  // amounts; mixing the two made the button show a wrong/zero amount.
+  const walletCur = wallet.currency as Currency;
+  let walletPayable = payable;
+  if (walletCur !== (user.currency as Currency)) {
+    try {
+      const [wView, wCoupon] = await Promise.all([
+        getCartView(user.id, walletCur),
+        getCartCoupon(user.id, walletCur),
+      ]);
+      walletPayable = Math.max(0, wView.subtotalMinor - (wCoupon?.discountMinor ?? 0));
+    } catch {
+      // No price list in the wallet currency — fall back to the configured rate.
+      walletPayable = convertMinor(payable, user.currency as Currency, walletCur);
+    }
+  }
+  const enough = wallet.balanceMinor >= BigInt(walletPayable);
+  const crossCur = walletCur !== (user.currency as Currency);
+  const walletChargeLabel = `${fmt(walletPayable, walletCur)}${walletCur === "USD" ? " USDT" : ""}`;
+  const lines = [
+    header(`🛒 ${bold("Checkout")}`),
+    "",
+    cartText(view),
+    ...(coupon ? [`🎟 Coupon <b>${escapeHtml(coupon.code)}</b>: −${fmt(discount, view.currency)}`, `💳 <b>Total to pay: ${fmt(payable, view.currency)}</b>`] : []),
+    "",
+    view.hasCustomPrice ? `💎 <b>Special price just for you, ${greetName(user)}!</b>` : "",
+    `Wallet balance: <b>${fmt(wallet.balanceMinor, wallet.currency)}</b>${walletCur === "USD" ? " USDT" : ""}`,
+    crossCur ? `🔁 Wallet charge for this order: <b>${walletChargeLabel}</b>  <i>(${fmt(payable, view.currency)})</i>` : "",
+    (user.currency as string) === "INR" && upiOn
+      ? "\n💡 <b>Paying in USDT is cheaper</b> — INR prices include a small handling fee.\n⚡ Binance (USDT) also delivers instantly, while UPI is verified by hand."
+      : "",
+    !upi.ok && upi.reason === "over_limit" && upi.maxMinor
+      ? `ℹ️ UPI is available for orders up to <b>${fmt(upi.maxMinor, "INR")}</b> — this order is paid with crypto / Binance (instant, automatic).`
+      : "",
+    gateways.length === 0 && !enough ? "⚠️ Balance too low — top up your wallet first." : "",
+    combo.applied ? `🎁 <b>Combo deal applied — ${combo.pct}% off</b> for buying ${combo.distinct} different products!` : "",
+    !combo.applied && combo.need > 0 && combo.pct > 0 ? `🎁 Add <b>${combo.need} more product${combo.need === 1 ? "" : "s"}</b> and get <b>${combo.pct}% off</b> the whole cart.` : "",
+  ].filter((l) => l !== "");
+  // New-account cap: a brand-new account cannot place a large first order.
+  const cap = await firstOrderAllowed(user.id, payable, user.currency as Currency).catch(() => ({ ok: true as const }));
+  if (!cap.ok) {
+    lines.push("", cap.reason === "daily_limit"
+      ? `🛡 <b>Daily limit reached:</b> up to <b>${cap.maxPerDay}</b> orders per 24 hours per account. Please try again later.`
+      : `🛡 <b>First order limit:</b> new accounts can order up to <b>${cap.maxUsd}</b> for the first ${cap.hoursLeft} h. Please start with a smaller order — the limit lifts after your first purchase.`);
+    const kb0 = new InlineKeyboard();
+    kb0.add(sbtn("🛒 Edit cart", cb("crt", "view"), "primary")).row();
+    navRow(kb0, cb("crt", "view"));
+    return { text: lines.join("\n"), kb: kb0 };
+  }
+  // "Buy together" — two real co-purchase suggestions. They sit BELOW the pay
+  // buttons: the customer came here to pay, so paying is the first thing on
+  // the card and the upsell is an afterthought near the bottom, not a wall of
+  // ➕ Add buttons between them and the money.
+  const suggest = await alsoBought(user.id, user.currency as Currency, 2).catch(() => []);
+  const kb = new InlineKeyboard();
+  if (coupon) kb.add(sbtn(`🎟 ${coupon.code} applied — ✖️ Remove`, cb("crt", "couponrm"), "primary")).row();
+  else kb.add(sbtn("🎟 Apply coupon", cb("crt", "coupon"), "primary")).row();
+  if (view.allAvailable && enough) {
+    const label = crossCur
+      ? `💰 Pay ${walletChargeLabel} from Wallet  (${fmt(payable, view.currency)})`
+      : `💰 Pay ${fmt(payable, view.currency)} from Wallet`;
+    kb.add(sbtn(label, cb("ord", "paywallet"), "success")).row();
+  } else if (view.allAvailable && wallet.balanceMinor > 0n) {
+    // Not enough for the whole order — spend what they have and pay the rest.
+    const need = Math.max(0, walletPayable - Number(wallet.balanceMinor));
+    if (binanceOn) kb.add(sbtn(`🪙 Use wallet ${fmt(wallet.balanceMinor, walletCur)} + pay ${fmt(need, walletCur)} via Binance`, cb("ord", "paybinance", "w"), "success")).row();
+    if (cryptoReady) kb.add(sbtn(`🌐 Use wallet ${fmt(wallet.balanceMinor, walletCur)} + pay rest in crypto (BEP20/TRC20/SOL/LTC…)`, cb("ord", "crypto", "w"), "success")).row();
+    if (upiOn) {
+      kb.add(sbtn(`🇮🇳 Use wallet + pay rest via UPI 🕐`, cb("ord", "payupi", "w"), "primary")).row();
+    }
+    kb.add(sbtn(`➕ Or top up ${fmt(need, walletCur)} first`, cb("wal", "crypto"), "primary")).row();
+  }
+  // BNPL is held in the USER's currency (getBnplStatus reads user.currency), not
+  // the wallet's. Comparing a wallet-currency amount against the credit limit —
+  // and printing it with the BNPL currency — quoted the wrong number and offered
+  // or hid the button wrongly whenever the two currencies had drifted apart.
+  if (view.allAvailable && bnpl.limitMinor > 0 && bnpl.availableMinor >= payable && payable > 0) {
+    kb.add(sbtn(`🕒 Pay Later — ${fmt(payable, bnpl.currency as Currency)} (BNPL)`, cb("ord", "paybnpl"), "primary")).row();
+  }
+  if (view.allAvailable) {
+    for (const p of gateways) {
+      kb.text(PROVIDER_LABELS[p.id], cb("ord", "paygw", p.id)).row();
+    }
+    if (binanceOn) {
+      kb.add(sbtn("🪙 Pay via Binance (USDT) ⚡ instant", cb("ord", "paybinance"), "success")).row();
+    }
+    if (cryptoReady) {
+      kb.add(sbtn(`${iconId("crypto") ? "" : "🌐 "}Pay with Crypto — BEP20 / TRC20 / Solana / LTC… ⚡ auto`, cb("ord", "crypto"), "success", iconId("crypto"))).row();
+    }
+    // UPI is INR-only — hidden from USD/USDT customers, when switched off, and
+    // above the admin's UPI cap.
+    if (upiOn) {
+      // The label used to say "manual approval" unconditionally. Once a provider
+      // is configured and auto-delivery is on, payments are verified against the
+      // merchant account and delivered without anyone tapping anything, so
+      // telling the customer to expect a wait costs sales for no reason.
+      const [policy, provider] = await Promise.all([getUpiAutoPolicy(), getUpiProvider()]);
+      const instant = policy.enabled && Boolean(provider);
+      kb.add(sbtn(
+        instant ? "🇮🇳 Pay via UPI (INR) ⚡ instant" : "🇮🇳 Pay via UPI (INR) 🕐 manual approval",
+        cb("ord", "payupi"), instant ? "success" : "primary",
+      )).row();
+    }
+  }
+  if (suggest.length > 0) {
+    lines.push("", `🛍 <i>Buy together: ${suggest.map((sgt) => `${escapeHtml(sgt.name)} (${fmt(sgt.priceMinor, sgt.currency)})`).join(" · ")}${!combo.applied && combo.need > 0 && combo.pct > 0 ? ` — unlocks ${combo.pct}% combo off` : ""}</i>`);
+    for (const sgt of suggest) kb.text(`🛍 + ${clip(sgt.name, 26)} · ${fmt(sgt.priceMinor, sgt.currency)}`, cb("crt", "addco", sgt.variantId)).row();
+  }
+  navRow(kb, cb("crt", "view"));
+  return { text: lines.join("\n"), kb };
+}
+
+export async function ordersView(user: BotUser, page: number): Promise<View> {
+  const result = await listOrders(user.id, page);
+  const statusEmoji: Record<string, string> = {
+    COMPLETED: "✅",
+    PAID: "💳",
+    PENDING_FULFILLMENT: "🕐",
+    PENDING_PAYMENT: "⌛",
+    CANCELLED: "🚫",
+    EXPIRED: "⌛",
+    REFUNDED: "↩️",
+  };
+  const kb = new InlineKeyboard();
+  for (const o of result.items) {
+    kb.text(
+      `${o.isReplacement ? "🔄" : (statusEmoji[o.status] ?? "•")} ${o.orderNumber} · ${o.isReplacement ? "Replacement" : fmt(o.totalPaidMinor, o.currency)}`,
+      cb("ord", "view", o.id),
+    ).row();
+  }
+  paginationRow(kb, "ord", "list", result.page, result.pages);
+  backToMenuRow(kb);
+  const onPage = result.items.length;
+  const delivered = result.items.filter((o) => o.status === "COMPLETED").length;
+  const waiting = result.items.filter((o) => o.status === "PENDING_PAYMENT" || o.status === "PENDING_FULFILLMENT").length;
+  return { text: onPage > 0
+    ? [
+        header(`📦 ${bold("Your Orders")}`),
+        "",
+        // Counts describe THIS page, and say so — claiming a total would be
+        // wrong as soon as there is more than one page.
+        `📄 <b>Page:</b>  <code>${result.page} of ${result.pages}</code>`,
+        `✅ <b>Delivered:</b>  <code>${delivered} of ${onPage} shown</code>`,
+        waiting > 0 ? `🕐 <b>In progress:</b>  <code>${waiting}</code>` : "",
+        HR,
+        "<i>Tap any order to view or re-copy your delivered keys and accounts.</i>",
+        "",
+        "✅ delivered · 💳 paid · 🕐 being delivered · ⌛ awaiting payment · ↩️ refunded",
+      ].filter(Boolean).join("\n")
+    : [
+        header(`📦 ${bold("Your Orders")}`),
+        "",
+        `📄 <b>Orders:</b>  <code>none yet</code>`,
+        HR,
+        "<i>Head to 🛍 Shop to make your first purchase — delivery is instant for most items.</i>",
+      ].join("\n"), kb };
+}
+
+export async function vaultView(user: BotUser, page: number): Promise<View> {
+  const result = await listVault(user.id, page);
+  const kb = new InlineKeyboard();
+  for (const item of result.items) {
+    const vn = item.variantName.trim().toLowerCase() === "standard" ? "" : ` · ${item.variantName}`;
+    kb.text(`🔑 ${item.productName}${vn}`, cb("lic", "view", item.orderItemId)).row();
+  }
+  paginationRow(kb, "lic", "list", result.page, result.pages);
+  backToMenuRow(kb);
+  return {
+    text: result.items.length > 0 ? "🔑 <b>My Licenses</b>\nTap an item to re-view its credentials." : "🔑 Nothing delivered yet.",
+    kb,
+  };
+}
+
+export async function walletView(user: BotUser): Promise<View> {
+  const [wallet, bnpl] = await Promise.all([getWallet(user.id), getBnplStatus(user.id)]);
+  const [binanceOn, upiW, cryptoOn] = await Promise.all([
+    binanceOffered().catch(() => false),
+    (user.currency as string) === "INR" ? upiOffered().catch(() => ({ ok: false })) : Promise.resolve({ ok: false }),
+    cryptoTerminalReady().catch(() => false),
+  ]);
+  const kb = new InlineKeyboard();
+  // "Top up" opens the Binance deposit card; when Binance is switched off it
+  // goes to UPI instead, and when both are off the crypto terminal is the way.
+  // ONE "Top up": amount first, then every method the shop offers — crypto
+  // networks, Binance Pay, UPI — in one picker. Binance alone used to be the
+  // whole deposit screen.
+  if (cryptoOn || binanceOn || upiW.ok) kb.text("➕ Top up", cb("wal", "crypto"));
+  kb.text("📜 History", cb("wal", "hist", 1)).row();
+  if (cryptoOn) kb.add(sbtn(`${iconId("deposit") ?? iconId("crypto") ? "" : "🌐 "}Deposit crypto — BEP20 / TRC20 / Solana / LTC…`, cb("wal", "crypto"), "success", iconId("deposit") ?? iconId("crypto"))).row();
+  kb.add(sbtn("🎁 Gift balance to a friend", cb("wal", "gift"), "primary"), sbtn("🎟 Redeem gift code", cb("wal", "giftredeem"), "primary")).row();
+  if (bnpl.outstandingMinor > 0) kb.add(sbtn(`🕒 Repay BNPL — ${fmt(bnpl.outstandingMinor, bnpl.currency)}`, cb("wal", "bnplrepay"), "success")).row();
+  backToMenuRow(kb);
+  const spendable = wallet.balanceMinor > 0n;
+  const lines = [
+    header(`💰 ${bold("Wallet")}`),
+    "",
+    `💲 <b>Balance:</b>  <code>${fmt(wallet.balanceMinor, wallet.currency)}</code>`,
+    wallet.currency === "USD"
+      ? `🇮🇳 <b>Worth:</b>  <code>₹${(convertMinor(Number(wallet.balanceMinor), "USD" as Currency, "INR" as Currency) / 100).toFixed(2)}</code> at the store rate`
+      : `🪙 <b>Worth:</b>  <code>${toUsdt(Number(wallet.balanceMinor), wallet.currency as Currency)} USDT</code> at the store rate`,
+    `📊 <b>Status:</b>  ${bnpl.outstandingMinor > 0n ? "REPAYMENT DUE" : spendable ? "READY TO SPEND" : "EMPTY"}`,
+  ];
+  if (bnpl.limitMinor > 0) {
+    lines.push(
+      HR,
+      `🕒 <b>Pay Later (BNPL)</b>`,
+      `Limit: <b>${fmt(bnpl.limitMinor, bnpl.currency)}</b> · Owed: <b>${fmt(bnpl.outstandingMinor, bnpl.currency)}</b> · Available: <b>${fmt(bnpl.availableMinor, bnpl.currency)}</b>`,
+    );
+  }
+  lines.push(
+    HR,
+    spendable
+      ? "<i>Your balance is spent automatically at checkout — no need to pay again.</i>"
+      : "<i>Top up instantly with Binance (USDT) or UPI, then pay for anything in one tap.</i>",
+    "",
+    "Use the buttons below to manage your wallet.",
+  );
+  return { text: lines.join("\n"), kb };
+}
+
+export async function walletHistoryView(user: BotUser, page: number): Promise<View> {
+  const ledger = await getLedger(user.id, page);
+  const sign = (n: bigint) => (n >= 0n ? "+" : "−");
+  const lines = ledger.entries.map((e) => {
+    const amt = e.amountMinor < 0n ? -e.amountMinor : e.amountMinor;
+    // Each row in the currency it was written in (a wallet that switched
+    // INR↔USD has both) — formatting all of them in today's currency showed
+    // ₹500 top-ups as $500.
+    return `${sign(e.amountMinor)}${fmt(amt, e.currency)} · ${e.type}${e.note ? ` · ${escapeHtml(e.note)}` : ""}`;
+  });
+  const kb = new InlineKeyboard();
+  paginationRow(kb, "wal", "hist", ledger.page, ledger.pages);
+  kb.row().text("◀️ Wallet", cb("wal", "view"));
+  backToMenuRow(kb);
+  return { text: ["📜 <b>Wallet History</b>", "", ...(lines.length > 0 ? lines : ["No transactions yet."])].join("\n"), kb };
+}
+
+export async function referralView(user: BotUser, botUsername: string): Promise<View> {
+  // Referral rewards are credited to the WALLET, so they are wallet-currency
+  // amounts. Printing them with user.currency mislabelled the figure after a
+  // currency switch — and disagreed with 👤 My Account, which gets it right.
+  const [stats, cfg, wallet, mile, earn] = await Promise.all([
+    getReferralStats(user.id), getReferralConfig(), getWallet(user.id),
+    milestoneProgress(user.id).catch(() => null), referralEarnings(user.id).catch(() => null),
+  ]);
+  const link = `https://t.me/${botUsername}?start=ref_${user.referralCode}`;
+  const store = loadConfig().STORE_NAME;
+  const shareText = `🎁 Join ${store} — instant digital products at the best prices! Use my link:`;
+  const pct = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1).replace(/\.0$/, ""));
+  const months = cfg.commissionMonths;
+  const forHowLong = months > 0 ? `for the next <b>${months} month${months === 1 ? "" : "s"}</b>` : "<b>for life</b>";
+  const firstTier = mile?.cfg.tiers[0] ?? null;
+  const what = mile?.cfg.mode === "purchased" ? "friends who buy" : "friends";
+
+  // The pitch, in one breath: the bonus (if any), the commission, how long.
+  const pitch: string[] = [];
+  if (firstTier) pitch.push(`🎯 <b>Refer ${firstTier.count} ${what} → get $${firstTier.rewardUsd.toFixed(2)} bonus!</b>`);
+  pitch.push(`💸 Earn <b>${pct(cfg.firstPct)}%</b> on every friend's first order${cfg.repeatPct > 0 ? ` + <b>${pct(cfg.repeatPct)}%</b> on everything they buy ${forHowLong}` : ""}.`);
+  pitch.push("💰 Paid straight into your wallet — spend it on any product.");
+
+  // Earnings: credited vs held, and the hold's countdown.
+  const money: string[] = [`👥 Invited: <b>${num(stats.invited)}</b>   ·   🛍 Bought: <b>${num(stats.purchased)}</b>`, `💰 Earned: <b>${fmt(stats.earnedMinor, wallet.currency)}</b>`];
+  if (earn && earn.heldCount > 0) {
+    const hrs = earn.nextReleaseAt ? Math.max(1, Math.ceil((earn.nextReleaseAt.getTime() - Date.now()) / 3_600_000)) : 0;
+    money.push(earn.readyCount > 0
+      ? `⏳ Ready to transfer: <b>${fmt(earn.readyMinor, earn.heldCurrency)}</b> — tap 💰 Transfer to wallet below.${earn.heldMinor > earn.readyMinor ? ` (+${fmt(earn.heldMinor - earn.readyMinor, earn.heldCurrency)} still on hold)` : ""}`
+      : `⏳ On hold: <b>${fmt(earn.heldMinor, earn.heldCurrency)}</b> — unlocks in ~${hrs}h (${cfg.holdHours}h anti-fraud hold), then moves to your wallet by itself.`);
+  }
+
+  // Milestone ladder + progress bar.
+  const ladder: string[] = [];
+  if (mile) {
+    ladder.push(HR, `🏆 <b>Bonus ladder</b> (new ${what} from ${new Date(mile.cfg.startedAt).toLocaleDateString("en-GB", { day: "2-digit", month: "short" })})`);
+    for (const t of mile.cfg.tiers.slice(0, 6)) ladder.push(`${mile.count >= t.count ? "✅" : "▫️"} <b>${t.count}</b> → <b>$${t.rewardUsd.toFixed(2)}</b>`);
+    if (mile.cfg.repeatLast && mile.cfg.tiers.length) {
+      const last = mile.cfg.tiers[mile.cfg.tiers.length - 1]!;
+      ladder.push(`🔁 …and <b>$${last.rewardUsd.toFixed(2)}</b> again for every further <b>${last.count}</b>`);
+    }
+    if (mile.next) {
+      const filled = Math.max(0, Math.min(10, Math.round((mile.count / mile.next.count) * 10)));
+      ladder.push(`${"🟩".repeat(filled)}${"⬜".repeat(10 - filled)} <b>${mile.count}/${mile.next.count}</b> — ${mile.next.count - mile.count} more → $${mile.next.rewardUsd.toFixed(2)}`);
+    } else {
+      ladder.push(`🎉 Every milestone unlocked (${mile.count} so far).`);
+    }
+    if (mile.paidUsd > 0) ladder.push(`💵 Bonuses received: <b>$${mile.paidUsd.toFixed(2)}</b>`);
+  }
+
+  const kb = new InlineKeyboard()
+    .url("📤 Share my link", `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareText)}`)
+    .row();
+  if (earn && earn.heldCount > 0) {
+    kb.add(sbtn(earn.readyCount > 0 ? `💰 Transfer ${fmt(earn.readyMinor, earn.heldCurrency)} to wallet` : "💰 Transfer to wallet", cb("ref", "claim"), earn.readyCount > 0 ? "success" : "primary")).row();
+  }
+  kb.add(sbtn("💳 My wallet", cb("wal", "view"), "primary")).row();
+  backToMenuRow(kb);
+  return {
+    text: [
+      header(`🎁 ${bold("Refer & Earn")}`),
+      "",
+      ...pitch,
+      HR,
+      ...money,
+      ...ladder,
+      HR,
+      "⚡ <b>3 steps</b>",
+      "1️⃣ Share your link  →  2️⃣ Friend joins &amp; buys  →  3️⃣ Money lands in your wallet",
+      HR,
+      `🔗 <b>Your link</b> (tap to copy)`,
+      `<code>${link}</code>`,
+    ].join("\n"),
+    kb,
+  };
+}
+
+export async function supportHomeView(user: BotUser): Promise<View> {
+  const [tickets, faq] = await Promise.all([listTickets(user.id, 1), listFaq().catch(() => [])]);
+  const kb = new InlineKeyboard();
+  // Quick answers first: most "tickets" are the same three questions.
+  for (const f of faq.slice(0, 4)) kb.text(`💡 ${clip(f.q, 48)}`, cb("faq", "q", f.id)).row();
+  kb.add(sbtn("💬 Chat with Support", cb("sup", "chat"), "success")).row().text("🆕 New Ticket", cb("sup", "new")).row();
+  for (const t of tickets.items.slice(0, 5)) {
+    const dot = t.status === "WAITING_CUSTOMER" ? "💬" : t.status === "RESOLVED" ? "✅" : t.status === "CLOSED" ? "🔒" : "⌛";
+    kb.text(`${dot} ${t.ticketNumber} · ${clip(t.subject, 22)}`, cb("tkt", "open", t.id)).row();
+  }
+  backToMenuRow(kb);
+  return {
+    text: [
+      "🎫 <b>Help & Support</b>",
+      "",
+      "• Tap 🛍 Shop, open a product, tap ⚡ Buy, choose quantity, and pay.",
+      "• Your delivered items live in 📦 My Orders — tap an order to view them.",
+      "• Pay with UPI, Binance (USDT) or your wallet.",
+      "",
+      "💬 Tap <b>Chat with Support</b> to message our team live — we reply right here.",
+      "Or open a 🆕 Ticket for a tracked request — tap any ticket below to read the replies.",
+      "",
+      "💬 = support replied   ⌛ = with our team   ✅ = resolved   🔒 = closed",
+    ].join("\n"),
+    kb,
+  };
+}
+
+/**
+ * Shop by category — a 3-across grid of tiles.
+ *
+ * 🔥 marks a category with a featured product; sold-out categories are styled
+ * differently rather than hidden, because a customer looking for a brand we do
+ * stock (just not today) needs to see that it exists.
+ */
+export async function categoryGridView(user: BotUser): Promise<View> {
+  const tiles = await listCategoryTiles();
+  const kb = new InlineKeyboard();
+  if (tiles.length === 0) {
+    kb.add(sbtn("🛍 Browse everything", cb("shp", "home", 1), "success")).row();
+    backToMenuRow(kb);
+    return {
+      text: [header(`🗂 ${bold("Shop by Category")}`), "", "No categories yet — tap below to browse the whole shop."].join("\n"),
+      kb,
+    };
+  }
+  // Three per row, matching the tile layout.
+  for (let i = 0; i < tiles.length; i += 3) {
+    for (const t of tiles.slice(i, i + 3)) {
+      const label = clip(`${t.hot ? "🔥 " : ""}${t.emoji ? `${t.emoji} ` : ""}${t.name}`, 24);
+      // Sold-out tiles are styled danger so they read differently at a glance.
+      kb.add(sbtn(label, cb("cat", "open", t.id), t.inStock ? "success" : "danger"));
+    }
+    kb.row();
+  }
+  kb.add(sbtn("🛍 Browse everything", cb("shp", "home", 1), "primary")).row();
+  backToMenuRow(kb);
+  const soldOut = tiles.filter((t) => !t.inStock).length;
+  return {
+    text: [
+      header(`🗂 ${bold("Shop by Category")}`),
+      "",
+      `Pick a category — <b>${tiles.length}</b> to choose from.`,
+      "",
+      "🔥 = has something featured" + (soldOut > 0 ? `   ·   🔴 = ${soldOut} currently sold out` : ""),
+    ].join("\n"),
+    kb,
+  };
+}
+
+/** Products inside one category tile, including any sub-categories under it. */
+export async function categoryProductsView(user: BotUser, categoryId: string, page: number): Promise<View> {
+  const [ids, tiles] = await Promise.all([categoryIdsUnder(categoryId), listCategoryTiles()]);
+  const tile = tiles.find((t) => t.id === categoryId);
+  const result = await listProducts({
+    currency: user.currency as Currency,
+    page,
+    pageSize: 20,
+    userId: user.id,
+    locale: user.locale,
+    categoryIds: ids,
+  });
+  const kb = new InlineKeyboard();
+  for (const p of result.items) {
+    const price = p.fromPriceMinor === null ? "—" : fmt(p.fromPriceMinor, user.currency);
+    const sale = p.onSale ? "🔥 " : "";
+    kb.add(sbtn(
+      `${sale}${outMark(p)}${withIcon(p.iconEmoji, p.name, p.iconCustomEmojiId)} — ${price}${stockTag(p)}`,
+      cb("shp", "prod", p.id),
+      p.inStock ? ((p.buttonStyle as "primary" | "success" | "danger" | null) ?? "success") : "danger",
+      p.iconCustomEmojiId ?? undefined,
+    )).row();
+  }
+  paginationRow(kb, "cat", "open", result.page, result.pages, categoryId);
+  kb.row().text("🗂 All categories", cb("cat", "home"));
+  backToMenuRow(kb);
+  const title = `${tile?.emoji ? `${tile.emoji} ` : "🗂 "}${tile?.name ?? "Category"}`;
+  return {
+    text: result.items.length > 0
+      ? `${header(escapeHtml(bold(title)))}\n<i>Tap a product → choose quantity → pay from your 💰 wallet.</i>`
+      : `${header(escapeHtml(bold(title)))}\n\nNothing available here right now — it's being restocked. Tap 🔔 Notify me on a product to hear first.`,
+    kb,
+  };
+}
+
+export async function profileView(user: BotUser): Promise<View> {
+  const [wallet, orders, bnpl, ref] = await Promise.all([
+    getWallet(user.id),
+    listOrders(user.id, 1),
+    getBnplStatus(user.id).catch(() => null),
+    getReferralStats(user.id).catch(() => null),
+  ]);
+  // Orders keep the currency they were PLACED in, so after a currency switch
+  // this list mixes ₹ and $ amounts. Adding them raw and then printing the total
+  // with the wallet's symbol invented a number that was simply wrong.
+  const spent = orders.items.reduce(
+    (n, o) => n + (o.currency === wallet.currency ? o.totalPaidMinor : convertMinor(o.totalPaidMinor, o.currency as Currency, wallet.currency as Currency)),
+    0,
+  );
+  const done = orders.items.filter((o) => o.status === "COMPLETED").length;
+  const kb = new InlineKeyboard()
+    .add(sbtn("➕ Add balance", cb("wal", "crypto"), "success")).row()
+    // My Orders (the full list), not a truncated "recent" view. Replacement lives
+    // on each order now — you pick the exact unit there — so a separate button
+    // would just be a second, vaguer way in.
+    .add(sbtn("📦 My Orders", cb("ord", "list", 1), "primary")).row()
+    .add(sbtn("🔔 My Watchlist", cb("wch", "list"), "primary"), sbtn("🔑 Find my keys", cb("lic", "find"), "primary")).row()
+    .add(sbtn("🔐 2FA Code Generator", cb("otp", "tool"), "primary")).row()
+    .add(sbtn("🏆 My Tier", cb("prf", "tier"), "success"), sbtn("🎡 Spin & Win", cb("spn", "home"), "success")).row()
+    .add(sbtn("🎯 Missions", cb("msn", "home"), "primary")).row()
+    .add(sbtn("🎁 Refer & earn", cb("ref", "view"), "success")).row();
+  backToMenuRow(kb);
+  return {
+    text: [
+      header(`👤 ${bold("My Account")}`),
+      "",
+      `👋 <b>${escapeHtml([user.firstName, user.lastName].filter(Boolean).join(" ") || "there")}</b>`,
+      `🔗 Username: ${user.telegramHandle ? "@" + escapeHtml(user.telegramHandle) : "<i>not set</i>"}`,
+      `🆔 Your ID: <code>${user.telegramId ?? "—"}</code>`,
+      user.isVip ? `${e("vip")} <b>VIP member</b>` : "",
+      "",
+      HR,
+      `💳 Wallet: <b>${fmt(wallet.balanceMinor, wallet.currency)}</b>${
+        wallet.currency === "USD"
+          ? `  <i>(≈ ₹${(convertMinor(Number(wallet.balanceMinor), "USD" as Currency, "INR" as Currency) / 100).toFixed(2)})</i>`
+          : `  <i>(≈ ${toUsdt(Number(wallet.balanceMinor), wallet.currency as Currency)} USDT)</i>`
+      }`,
+      bnpl && bnpl.limitMinor > 0
+        ? `🕒 Pay Later: <b>${fmt(bnpl.availableMinor, bnpl.currency)}</b> available${bnpl.outstandingMinor > 0 ? ` · owed <b>${fmt(bnpl.outstandingMinor, bnpl.currency)}</b>` : ""}`
+        : "",
+      `📦 Orders: <b>${num(orders.items.length)}${orders.pages > 1 ? "+" : ""}</b>${done > 0 ? ` · ✅ ${num(done)} delivered` : ""}`,
+      spent > 0 ? `💰 Total spent: <b>${fmt(spent, wallet.currency)}</b>` : "",
+      ref && ref.invited > 0 ? `🎁 Invited: <b>${num(ref.invited)}</b> · bought <b>${num(ref.purchased)}</b> · earned <b>${fmt(ref.earnedMinor, wallet.currency)}</b>` : "",
+      HR,
+      "",
+      `💱 Currency: <b>${user.currency}</b>   ·   🌐 Language: <b>${user.locale.toUpperCase()}</b>`,
+      `📅 Member since ${user.createdAt.toISOString().slice(0, 10)}`,
+    ].filter((l) => l !== "").join("\n"),
+    kb,
+  };
+}
+
+export function settingsView(user: BotUser): View {
+  const kb = new InlineKeyboard()
+    .text(`Currency: ${user.currency} → switch`, cb("set", "curr"))
+    .row()
+    .text("Language: English (more coming)", cb("mnu", "noop"));
+  backToMenuRow(kb);
+  return { text: "⚙ <b>Settings</b>\n\nCurrency affects catalog prices for new wallet-ups.", kb };
+}
+
+export async function helpView(): Promise<View> {
+  const faq = await listFaq().catch(() => []);
+  const kb = new InlineKeyboard();
+  for (const f of faq.slice(0, 8)) kb.text(`❓ ${clip(f.q, 48)}`, cb("faq", "q", f.id)).row();
+  kb
+    .add(sbtn("🛍 Shop", cb("shp", "home", 1), "success")).row()
+    .text("💰 Wallet", cb("wal", "view")).text("📦 My Orders", cb("ord", "list", 1)).row()
+    .add(sbtn("💬 Chat with Support", cb("sup", "chat"), "primary")).row()
+    .text("🎫 Support / Tickets", cb("sup", "home")).row();
+  backToMenuRow(kb);
+  return {
+    text: [
+      header(`❓ ${bold("Help & Commands")}`),
+      "",
+      `🧭 ${bold("Commands & options")}`,
+      "/start — 🏠 open the main menu",
+      "/shop — 🛍 browse & buy products",
+      "/cart — 🛒 view your cart",
+      "/orders — 📦 your orders & delivered keys",
+      "/wallet — 💰 deposit & pay instantly",
+      "/support — 🎫 help & live support",
+      "/referral — 🎁 refer &amp; earn",
+      "/api — 🧑‍💻 developer API",
+      "/replace — 🔄 request a replacement (faulty item)",
+      "/track GIS-… — 🔎 status of one order",
+      "/language — 🌐 change language",
+      "/help — ❓ this guide",
+      "",
+      `More on the menu: 🎁 Refer &amp; Earn (invite friends, earn %), 💱 Currency, 🌐 Language, 🧑‍💻 Developer API.`,
+      "",
+      `🛒 ${bold("How to buy")}`,
+      "1. Open 🛍 Shop and tap a product.",
+      "2. Tap ⚡ Buy and choose the quantity.",
+      "3. Pay from your 💰 Wallet, or with Binance (USDT) / UPI.",
+      "4. Instant products arrive here in seconds and are saved in 🔑 My Licenses.",
+      "",
+      `💰 ${bold("Wallet")}`,
+      "Deposit any amount with Binance (USDT) and pay instantly at checkout. Open 💰 Wallet → ➕ Top up.",
+      "",
+      `🆘 ${bold("Need a human?")}`,
+      "Tap 🎫 Support to open a ticket — we reply right here in chat.",
+    ].join("\n"),
+    kb,
+  };
+}
+
+export async function apiKeysView(user: BotUser): Promise<View> {
+  const [keys, wallet] = await Promise.all([listApiKeysByOwner(user.id), getWallet(user.id)]);
+  const active = keys.filter((k) => !k.revokedAt);
+  const kb = new InlineKeyboard();
+  // One key per user, so the first tap generates and every later one
+  // regenerates — behind a confirmation, because regenerating breaks whatever
+  // is already using the old key.
+  const key = active[0];
+  if (!key) kb.add(sbtn("🔑 Generate API key", cb("api", "new"), "success")).row();
+  if (key) kb.text("💰 API Balance", cb("api", "balance")).text("📦 API Orders", cb("api", "orders")).row();
+  if (key) kb.text("🏷 My Selling Price", cb("api", "prices")).row();
+  if (key) kb.add(sbtn("🔄 Regenerate Key", cb("api", "regen"), "danger")).row();
+  kb.text("📖 API Documentation", cb("api", "docs")).row();
+  if (active.length > 0) kb.add(sbtn("🛠 Fix permissions (403 errors)", cb("api", "fixscopes"), "primary")).row();
+  backToMenuRow(kb);
+  return {
+    text: [
+      header(`🧑‍💻 ${bold("Developer API")}`),
+      "",
+      "Build on our store: browse the catalog, check your balance, and place orders from your wallet — all via a REST API.",
+      "<i>New here? Tap 📖 API Documentation for the base URL, auth header and example requests.</i>",
+      "",
+      key
+        ? [
+            `🔑 <b>Key:</b>  <code>${key.prefix}</code>`,
+            // Balance sits with the key because it is the number that decides
+            // whether the next API call can actually place an order.
+            `💲 <b>Balance:</b>  <code>${toUsdt(Number(wallet.balanceMinor), wallet.currency as Currency)} USDT</code>`,
+            `📊 <b>Status:</b>  ACTIVE`,
+            `📈 <b>Calls:</b>  <code>${num(key.callCount ?? 0)}</code>`,
+            "",
+            "<i>The full key is hidden for security — it was shown only once when generated. Need it again? Tap 🔄 Regenerate Key to get a new one.</i>",
+            "",
+            "Use the buttons below to manage your API access.",
+          ].join("\n")
+        : "📊 <b>Status:</b>  NO KEY\n\nTap 🔑 Generate API key to create your first key. You get one key, and you can regenerate it any time.",
+    ].join("\n"),
+    kb,
+  };
+}
+
+export async function apiKeysListView(user: BotUser): Promise<View> {
+  const keys = await listApiKeysByOwner(user.id);
+  const active = keys.filter((k) => !k.revokedAt);
+  const kb = new InlineKeyboard();
+  kb.add(sbtn("🔑 Generate another key", cb("api", "new"), "success")).row();
+  const lines = [header(`📋 ${bold("My API keys")}`), ""];
+  if (active.length === 0) lines.push("You have no active keys yet.");
+  for (const k of active.slice(0, 15)) {
+    lines.push(`• <b>${escapeHtml(k.name)}</b> — <code>${k.prefix}…</code> · ${num(k.callCount)} calls`);
+    kb.add(sbtn(`🗑 Revoke ${clip(k.name, 16)}`, cb("api", "revoke", k.id), "danger")).row();
+  }
+  navRow(kb, cb("api", "home"));
+  return { text: lines.join("\n"), kb };
+}
+
+export async function apiOrdersView(user: BotUser): Promise<View> {
+  const result = await listOrders(user.id, 1);
+  const statusEmoji: Record<string, string> = { COMPLETED: "✅", PAID: "💳", PENDING_FULFILLMENT: "🕐", PENDING_PAYMENT: "⌛", CANCELLED: "🚫", EXPIRED: "⌛", REFUNDED: "↩️", PARTIALLY_REFUNDED: "↩️" };
+  const kb = new InlineKeyboard();
+  const lines = [header(`📦 ${bold("API Orders")}`), "", "Recent orders on your account (including those placed via the API):", ""];
+  if (result.items.length === 0) lines.push("No orders yet.");
+  for (const o of result.items.slice(0, 15)) lines.push(`${statusEmoji[o.status] ?? "•"} <code>${o.orderNumber}</code> · ${fmt(o.totalPaidMinor, o.currency)} · ${o.status}`);
+  navRow(kb, cb("api", "home"));
+  return { text: lines.join("\n"), kb };
+}
+
+export async function resellerPricesView(user: BotUser): Promise<View> {
+  const rows = await listResellerPrices(user.id, user.currency as Currency, 40);
+  const kb = new InlineKeyboard();
+  for (const r of rows) {
+    const shown = r.myPriceMinor ?? r.basePriceMinor;
+    kb.text(
+      `${r.myPriceMinor !== null ? "⭐ " : ""}${clip(withIcon(r.iconEmoji, r.name), 28)} — ${shown === null ? "—" : fmt(shown, r.currency)}`,
+      cb("api", "setprice", r.productId),
+    ).row();
+  }
+  navRow(kb, cb("api", "home"));
+  const withPrice = rows.filter((r) => r.myPriceMinor !== null).length;
+  return {
+    text: [
+      header(`🏷 ${bold("My Selling Price")}`),
+      "",
+      `⭐ <b>Custom set:</b>  <code>${withPrice} of ${rows.length}</code>`,
+      HR,
+      "This is what <b>your</b> API returns to <b>your</b> customers. You still pay our price — the difference is your profit.",
+      "",
+      "Tap a product to set or change its price. ⭐ = your custom price is set.",
+      rows.length >= 40 ? "\n<i>Showing first 40 — use the API for the rest.</i>" : "",
+    ].filter(Boolean).join("\n"),
+    kb,
+  };
+}
+
+export async function apiBalanceView(user: BotUser): Promise<View> {
+  const wallet = await getWallet(user.id);
+  const kb = new InlineKeyboard().text("➕ Top up", cb("wal", "crypto")).row();
+  navRow(kb, cb("api", "home"));
+  return {
+    text: [
+      header(`💰 ${bold("API Balance")}`),
+      "",
+      `Available: <b>${toUsdt(Number(wallet.balanceMinor), wallet.currency as Currency)} USDT</b>`,
+      `<i>(wallet holds ${fmt(wallet.balanceMinor, wallet.currency)} ${wallet.currency})</i>`,
+      "",
+      "The API always reports this balance in <b>USDT</b> — <code>GET /balance</code> returns <code>balance</code> / <code>balanceUsdt</code> with <code>currency: \"USDT\"</code>.",
+      "",
+      "This is what the API spends when you place an order (<code>POST /orders</code>). Top up via ➕ Top up.",
+    ].join("\n"),
+    kb,
+  };
+}
+
+/** Last 5 orders — open one for its keys, or start a replacement. */
+export async function recentOrdersView(user: BotUser): Promise<View> {
+  const res = await listOrders(user.id, 1);
+  const items = res.items.slice(0, 5);
+  const icon = (st: string): string =>
+    st === "COMPLETED" ? "✅" : st === "PENDING_PAYMENT" ? "⌛" : st === "CANCELLED" || st === "EXPIRED" ? "🚫" : "🕐";
+  const kb = new InlineKeyboard();
+  for (const o of items) {
+    // Label replacements rather than showing a bare 0.00 with no explanation.
+    kb.text(`${o.isReplacement ? "🔄" : icon(o.status)} ${o.orderNumber} · ${o.isReplacement ? "Replacement" : fmt(o.totalPaidMinor, o.currency)}`, cb("ord", "view", o.id)).row();
+  }
+  if (items[0]) kb.add(sbtn(`⚡ Buy again — ${items[0].orderNumber}`, cb("ord", "again", items[0].id), "success")).row();
+  if (res.pages > 1) kb.add(sbtn("🗂 All orders", cb("ord", "list", 1), "primary")).row();
+  kb.add(sbtn("🔄 Request a replacement", cb("rep", "home"), "success")).row();
+  navRow(kb, cb("prf", "view"));
+  return {
+    text: items.length > 0
+      ? [
+          header(`📦 ${bold("Recent orders")}`),
+          "",
+          "Your last 5 orders. Tap one to see or re-copy its keys.",
+          "",
+          "✅ delivered · 🕐 in progress · ⌛ awaiting payment · 🚫 cancelled",
+          "",
+          "<i>Something not working? Tap 🔄 Request a replacement.</i>",
+        ].join("\n")
+      : `${header(`📦 ${bold("Recent orders")}`)}\n\nNo orders yet — head to 🛍 Shop to make your first purchase.`,
+    kb,
+  };
+}
+
+export function apiDocsView(): View {
+  const base = `${(loadConfig().PUBLIC_API_URL ?? "").replace(/\/$/, "")}/api/v1/developer`;
+  const hasUrl = (loadConfig().PUBLIC_API_URL ?? "").length > 0;
+  const kb = new InlineKeyboard();
+  if (hasUrl) kb.url("📖 Open full documentation", base).row();
+  if (hasUrl) kb.url("🤖 Machine-readable docs (.txt)", `${base}/docs.txt`).row();
+  navRow(kb, cb("api", "home"));
+  return {
+    text: [
+      header(`📖 ${bold("API Documentation")}`),
+      "",
+      hasUrl ? `Base URL:\n<code>${base}</code>` : "Base URL is shown once configured by the store.",
+      "",
+      ...(hasUrl
+        ? [
+            "🤖 <b>Importing into another shop or tool?</b>",
+            "Give it one of these instead of a docs page — they are made to be read automatically:",
+            `<code>${base}/docs.txt</code>`,
+            `<code>${base}/manifest</code>`,
+            "",
+          ]
+        : []),
+      `${bold("Auth")} — send your key as a header:`,
+      "<code>Authorization: Bearer YOUR_KEY</code>",
+      "<code>X-API-Key: YOUR_KEY</code>",
+      "",
+      `${bold("Endpoints")}`,
+      "• GET /products — buyable catalog",
+      "• GET /products/{id} — one product",
+      "• GET /balance — wallet balance + ledger",
+      "• POST /orders — place an order (paid from wallet)",
+      "• GET /orders/{orderNumber} — order status",
+      "• GET /health — liveness (no auth)",
+      "",
+      hasUrl ? `Full guide & examples: ${base}` : "",
+    ].filter((l) => l !== "").join("\n"),
+    kb,
+  };
+}
+
+export function languageView(user: BotUser): View {
+  const kb = new InlineKeyboard();
+  for (const l of LOCALES) kb.text(l.label, cb("lang", "set", l.code)).row();
+  backToMenuRow(kb);
+  return { text: t(user.locale, "lang_title"), kb };
+}
+
+export function currencyView(user: BotUser): View {
+  const kb = new InlineKeyboard()
+    .text("🌐 USD ($) — recommended", cb("cur", "set", "USD"))
+    .row()
+    .text("🇮🇳 INR (₹)", cb("cur", "set", "INR"))
+    .row();
+  backToMenuRow(kb);
+  return { text: `${t(user.locale, "cur_title")}\n<i>Your wallet balance and all prices are shown in the currency you pick. Current: <b>${user.currency}</b>. You can switch anytime.</i>`, kb };
+}
+
+export async function orderDetailView(user: BotUser, orderId: string): Promise<View> {
+  // Independent reads, so fetch them together.
+  const [items, meta] = await Promise.all([
+    listOrderItems(user.id, orderId),
+    prisma.order.findFirst({
+      where: { id: orderId, userId: user.id },
+      select: { replacementOfOrderId: true, orderNumber: true },
+    }).catch(() => null),
+  ]);
+  const kb = new InlineKeyboard();
+  if (items.length === 0) {
+    kb.text("◀️ Orders", cb("ord", "list", 1));
+    backToMenuRow(kb);
+    return { text: "No delivered items in this order yet.", kb };
+  }
+
+  // If this IS a replacement order, name the order it replaces and the unit.
+  let origNumber: string | null = null;
+  let replacedTail: string | null = null;
+  if (meta?.replacementOfOrderId) {
+    const [orig, prev] = await Promise.all([
+      prisma.order.findUnique({ where: { id: meta.replacementOfOrderId }, select: { orderNumber: true } }).catch(() => null),
+      // The unit this replacement superseded, so the mapping is visible from both ends.
+      (async () => {
+        const repItemIds = items.map((i) => i.orderItemId);
+        const prior = await prisma.orderItem.findFirst({
+          where: { replacedByItemId: { in: repItemIds } },
+          select: { deliveryPayloadEncrypted: true },
+        }).catch(() => null);
+        return prior;
+      })(),
+    ]);
+    origNumber = orig?.orderNumber ?? null;
+    if (prev?.deliveryPayloadEncrypted) {
+      try {
+        const pl = JSON.parse(decryptSecret(prev.deliveryPayloadEncrypted, loadConfig().ENCRYPTION_MASTER_KEY)) as { key?: string; username?: string };
+        const lbl = (pl.key ? (pl.key.split(/\r?\n/)[0] ?? "") : (pl.username ?? "")).trim();
+        replacedTail = lbl.length > 4 ? lbl.slice(-4) : lbl || null;
+      } catch { replacedTail = null; }
+    }
+  }
+
+  const lines: string[] = origNumber
+    ? [
+        "🔄 <b>Replacement issued</b>",
+        `This order holds the replacement for <b>${escapeHtml(origNumber)}</b>.`,
+        ...(replacedTail ? [`↩️ Replaced the unit ending <code>…${escapeHtml(replacedTail)}</code>`] : []),
+        "🛡 <i>Your warranty still runs from the original purchase date — a replacement does not extend it.</i>",
+        "",
+        "📦 <b>Replacement item</b>",
+        "",
+      ]
+    : [`📦 <b>Delivered items</b>${meta?.orderNumber ? ` · ${escapeHtml(meta.orderNumber)}` : ""}`, ""];
+
+  // EVERY unit on its own line — these used to be collapsed into "Licence Key ×5"
+  // with one button. But Telegram caps a message at 4096 chars and each unit costs
+  // ~95, so a 50-unit order would overflow and the send would fail outright.
+  // Show the first 25 and summarise the rest.
+  const MAX_LISTED = 25;
+  const shown = items.slice(0, MAX_LISTED);
+  let anyReplaceable = items.some((i) => !i.replaced);
+  for (const it of shown) {
+    const vn = it.variantName.trim().toLowerCase() === "standard" ? "" : ` · ${it.variantName}`;
+    const unit = (it.unitTotal ?? 1) > 1 ? ` — unit ${it.unitNumber}/${it.unitTotal}` : "";
+    const tail = it.tail ? ` <code>…${escapeHtml(it.tail)}</code>` : "";
+    let state = "✅ Active";
+    if (it.replaced) state = "🔄 Replaced — see the replacement order";
+    else if (it.isReplacementFor) state = "🆕 Replacement unit";
+    else if (it.warranty === false) state = "🏷 As-is (no warranty)";
+    else if (it.warrantyDaysLeft !== null && it.warrantyDaysLeft !== undefined) {
+      state = it.warrantyDaysLeft > 0 ? `🛡 ${it.warrantyDaysLeft}d warranty left` : "⌛ Warranty expired";
+    }
+    lines.push(`🔑 <b>${escapeHtml(it.productName)}${escapeHtml(vn)}</b>${unit}${tail}`);
+    lines.push(`   ${state}`);
+  }
+  if (items.length > MAX_LISTED) {
+    lines.push("", `➕ <i>and ${items.length - MAX_LISTED} more — tap 📄 Get all keys for the full list.</i>`);
+  }
+
+  if (items.length > 10) {
+    kb.add(sbtn(`📄 Get all ${items.length} keys`, cb("ord", "reveal", orderId), "success")).row();
+  } else {
+    // One button per UNIT, labelled so it is obvious which one it opens.
+    for (const it of shown) {
+      const unit = (it.unitTotal ?? 1) > 1 ? ` ${it.unitNumber}/${it.unitTotal}` : "";
+      const tail = it.tail ? ` …${it.tail}` : "";
+      const mark = it.replaced ? "🔄" : "🔑";
+      kb.text(`${mark} View${unit}${tail || ` ${clip(it.productName, 14)}`}`, cb("lic", "view", it.orderItemId)).row();
+    }
+    if (items.length > 1) kb.add(sbtn("📄 Get all keys", cb("ord", "reveal", orderId), "success")).row();
+  }
+  // A file beats scrolling once an order has more than a couple of units, and
+  // the un-numbered copy is the one a customer pastes into a password manager
+  // or a script — the "1) 2) 3)" prefixes are noise there.
+  if (items.length > 1) {
+    kb.add(sbtn("📄 Download all (.txt)", cb("ord", "txt", orderId), "primary")).row();
+    kb.add(sbtn("📄 Download — no numbering", cb("ord", "txtp", orderId), "primary")).row();
+  }
+  kb.add(sbtn("⚡ Buy this again", cb("ord", "again", orderId), "success")).row();
+  kb.add(sbtn("⭐ Rate this order", cb("rev", "new", orderId), "primary")).row();
+  // Per-ORDER replacement entry: pick exactly which unit(s) from THIS order.
+  if (anyReplaceable) {
+    kb.add(sbtn("🔄 Replace an item from this order", cb("rep", "ord", orderId), "danger")).row();
+  }
+  kb.text("◀️ Orders", cb("ord", "list", 1));
+  backToMenuRow(kb);
+  return { text: lines.join("\n"), kb };
+}
+
+/**
+ * Pick which delivered unit(s) of ONE order to claim on.
+ *
+ * Checkbox-style multi-select: tapping a unit toggles it, so a customer with five
+ * keys can select #2 and #4 only. Selection lives in the session and is
+ * re-validated server-side on submit — it is a request, not a fact.
+ */
+export async function replaceSelectView(user: BotUser, orderId: string, selected: string[], page = 1): Promise<View> {
+  const all = await listUnitsForOrder(user.id, orderId);
+  const kb = new InlineKeyboard();
+  if (all.length === 0) {
+    kb.text("◀️ Back", cb("ord", "view", orderId));
+    return { text: "Nothing delivered on this order yet.", kb };
+  }
+  const sel = new Set(selected);
+  const pickable = all.filter((u) => u.route === "claim" || u.route === "ticket");
+  // Paged: one row and ~100 characters per unit would blow both the 4096-char
+  // message limit and any sane keyboard past about 38 units.
+  const PER_PAGE = 20;
+  const pages = Math.max(1, Math.ceil(all.length / PER_PAGE));
+  const p = Math.min(Math.max(1, page), pages);
+  const units = all.slice((p - 1) * PER_PAGE, p * PER_PAGE);
+
+  for (const u of units) {
+    const unit = u.unitTotal > 1 ? ` ${u.unitNumber}/${u.unitTotal}` : "";
+    const tail = u.tail ? ` …${u.tail}` : "";
+    if (u.route === "claim" || u.route === "ticket") {
+      const box = sel.has(u.orderItemId) ? "☑️" : "⬜";
+      const cover = u.route === "claim" ? "🛡" : "🏷";
+      kb.text(`${box} ${cover} Unit${unit}${tail}`, cb("rep", "tog", u.orderItemId)).row();
+    } else {
+      // Not selectable, but still shown — silence would look like a missing key.
+      kb.text(`🚫 Unit${unit}${tail} — ${clip(u.reason ?? "not eligible", 22)}`, cb("mnu", "noop")).row();
+    }
+  }
+  if (pages > 1) {
+    if (p > 1) kb.text("◀️ Prev", cb("rep", "pg", orderId, String(p - 1)));
+    kb.text(`${p}/${pages}`, cb("mnu", "noop"));
+    if (p < pages) kb.text("Next ▶️", cb("rep", "pg", orderId, String(p + 1)));
+    kb.row();
+  }
+  if (sel.size > 0) {
+    kb.add(sbtn(`📨 Continue with ${sel.size} item(s)`, cb("rep", "go", orderId), "success")).row();
+  }
+  if (pickable.length > 1) {
+    // Compare against the cap, not the raw count, or the toggle can never clear.
+    const capped = Math.min(pickable.length, 25);
+    kb.text(sel.size >= capped ? "✖️ Clear selection" : "☑️ Select all eligible", cb("rep", "all", orderId)).row();
+  }
+  kb.text("◀️ Back to order", cb("ord", "view", orderId)).row();
+  backToMenuRow(kb);
+
+  const first = all[0] as ReplaceableItem;
+  return {
+    text: [
+      header(`🔄 ${bold("Which item needs replacing?")}`),
+      `🧾 ${escapeHtml(first.orderNumber)}${pages > 1 ? ` · page ${p}/${pages}` : ""}`,
+      "",
+      "Tap the exact unit(s) you're having trouble with — you can pick one, several, or all of them.",
+      "",
+      ...units.map((u) => {
+        const unit = u.unitTotal > 1 ? ` — unit ${u.unitNumber}/${u.unitTotal}` : "";
+        const tail = u.tail ? ` <code>…${escapeHtml(u.tail)}</code>` : "";
+        const st = u.route === "claim"
+          // Below a day, show hours: "1d left" on a 6-hour window was a lie
+          // that only became visible when the cover silently ran out.
+          ? `🛡 In warranty${u.hoursLeft !== null ? ` · ${formatDuration(u.hoursLeft)} left` : ""} — replacement claim`
+          : u.route === "ticket"
+            ? `🏷 ${escapeHtml(u.reason ?? "Out of warranty")} — support ticket`
+            : `🚫 ${escapeHtml(u.reason ?? "Not eligible")}`;
+        return `${sel.has(u.orderItemId) ? "☑️" : u.route === "blocked" ? "🚫" : "⬜"} <b>${escapeHtml(u.label)}</b>${unit}${tail}\n   ${st}`;
+      }),
+      "",
+      "<i>🛡 items are covered and go straight to review. 🏷 items are outside warranty, so they open a support ticket instead — a person decides those.</i>",
+    ].join("\n"),
+    kb,
+  };
+}
+
+export function quantityPickerView(variantId: string, stock: number, productId?: string): View {
+  const presets = [1, 2, 5, 10, 20, 50].filter((q) => q <= stock);
+  if (stock < 1_000_000 && stock > 0 && !presets.includes(stock)) presets.push(stock); // exact max
+  presets.sort((a, b) => a - b);
+  if (presets.length === 0) presets.push(1);
+  const kb = new InlineKeyboard();
+  presets.forEach((q, i) => {
+    kb.text(`${q}`, cb("crt", "qty", variantId, q));
+    if ((i + 1) % 3 === 0) kb.row();
+  });
+  kb.row();
+  kb.text("✏️ Custom amount", cb("crt", "qtycustom", variantId)).row();
+  navRow(kb, productId ? cb("shp", "prod", productId) : cb("shp", "home", 1));
+  const cap = stock >= 1_000_000 ? "" : ` (max ${stock} available)`;
+  return { text: `🔢 <b>How many do you want?</b>${cap}`, kb };
+}
+
+/** 🔄 Replacement — pick a delivered item to claim on. */
+export async function replaceListView(user: BotUser): Promise<View> {
+  const items = await listReplaceableItems(user.id, 20);
+  const kb = new InlineKeyboard();
+  for (const i of items) {
+    const tag = i.route === "claim" ? "🔄" : i.route === "blocked" ? "⌛" : (i.warranty ? "⏳" : "🚫");
+    kb.text(`${tag} ${clip(i.label, 28)} · ${i.orderNumber}`, cb("rep", "pick", i.orderItemId)).row();
+  }
+  backToMenuRow(kb);
+  return {
+    text: items.length
+      ? [
+          header(`🔄 ${bold("Request a Replacement")}`),
+          "",
+          "Tap the item you are having trouble with.",
+          "",
+          "🔄 = covered by warranty   ⏳ = warranty expired   🚫 = sold as-is   ⌛ = under review",
+          "",
+          "<i>Covered items get a replacement claim our team reviews. For ⏳ and 🚫 items you can raise a support ticket instead, and a real person will help.</i>",
+        ].join("\n")
+      : `${header(`🔄 ${bold("Request a Replacement")}`)}\n\nYou have no delivered items yet.`,
+    kb,
+  };
+}
+
+/**
+ * The 2FA code generator — a 2fa.live equivalent, inside the bot.
+ *
+ * Renders the live code, the seconds remaining, and the NEXT code when the window
+ * is nearly up, so someone who is mid-login is never handed a code that expires as
+ * they paste it. The secret is masked unless they ask to see it.
+ *
+ * Privacy: the secret lives only in the session, is never written to the database
+ * or a log, and 🗑 Clear removes it. The message the customer pasted it in is
+ * deleted as soon as it is read.
+ */
+export function otpToolView(secret: string | null, reveal: boolean): View {
+  const kb = new InlineKeyboard();
+  if (!secret) {
+    kb.add(sbtn("🔐 Paste 2FA secret", cb("otp", "ask"), "success")).row();
+    kb.text("◀️ My Account", cb("prf", "view")).row();
+    backToMenuRow(kb);
+    return {
+      text: [
+        header(`🔐 ${bold("2FA Code Generator")}`),
+        "",
+        "Paste a 2FA secret key and I'll give you the current 6-digit code — the same thing an authenticator app does.",
+        "",
+        "<b>How to use it</b>",
+        "1. Tap 🔐 Paste 2FA secret",
+        "2. Send the Base32 key (spaces and lower case are fine)",
+        "3. Copy the code — it refreshes every 30 seconds",
+        "",
+        "<i>🔒 I delete the message you paste it in, and your secret is never written to our database or any log. It is held encrypted for this session only so the code can refresh — 🗑 Clear removes it immediately.</i>",
+      ].join("\n"),
+      kb,
+    };
+  }
+
+  const t = generateTotp(secret);
+  if (!t) {
+    kb.add(sbtn("🔐 Send a different secret", cb("otp", "ask"), "success")).row();
+    kb.add(sbtn("🗑 Clear", cb("otp", "clr"), "danger")).row();
+    kb.text("◀️ My Account", cb("prf", "view")).row();
+    return { text: `${header(`🔐 ${bold("2FA Code Generator")}`)}\n\n⚠️ That secret isn't valid Base32, so no code can be made from it.`, kb };
+  }
+
+  // Codes are 6 digits WITH leading zeroes preserved — "005924" is not "5924".
+  const pretty = `${t.code.slice(0, 3)} ${t.code.slice(3)}`;
+  const bars = Math.max(1, Math.round((t.secondsLeft / 30) * 10));
+  const masked = secret.length <= 8 ? "••••" : `${secret.slice(0, 4)}${"•".repeat(Math.min(16, secret.length - 8))}${secret.slice(-4)}`;
+
+  kb.copyText(`📋 Copy ${t.code}`, t.code).row();
+  kb.add(sbtn("🔄 Generate / refresh", cb("otp", "gen"), "success")).row();
+  kb.text(reveal ? "🙈 Hide secret" : "👁 Show secret", cb("otp", "eye")).row();
+  kb.add(sbtn("🔐 Use another secret", cb("otp", "ask"), "primary"), sbtn("🗑 Clear", cb("otp", "clr"), "danger")).row();
+  kb.text("◀️ My Account", cb("prf", "view")).row();
+  backToMenuRow(kb);
+
+  return {
+    text: [
+      header(`🔐 ${bold("2FA Code Generator")}`),
+      "",
+      `<code>${pretty}</code>`,
+      "",
+      `⏳ ${"█".repeat(bars)}${"░".repeat(10 - bars)} <b>${t.secondsLeft}s</b> left`,
+      ...(t.secondsLeft <= 8 ? [`⏭ Expiring — next code: <code>${t.nextCode}</code>`] : []),
+      "",
+      `🔑 Secret: <code>${escapeHtml(reveal ? secret : masked)}</code>`,
+      "",
+      "<i>Tap the code to copy it. Codes change every 30 seconds — tap 🔄 for a fresh one.</i>",
+    ].join("\n"),
+    kb,
+  };
+}
+
+/** Reason prompt for a multi-unit claim. */
+export function replaceBatchAskReasonView(count: number): View {
+  const kb = new InlineKeyboard().text("✖️ Cancel", cb("rep", "home"));
+  return {
+    text: [
+      header(`🔄 ${bold("What went wrong?")}`),
+      "",
+      `📦 <b>${count} item(s)</b> selected.`,
+      "",
+      "Step 1 of 2 — describe the problem in one message (e.g. <i>key already used</i>, <i>password not working</i>).",
+      "",
+      "<i>If some of the items are outside their warranty, those will open a support ticket instead of an automatic claim — we'll tell you which.</i>",
+    ].join("\n"),
+    kb,
+  };
+}
+
+export function replaceAskReasonView(label: string, viaTicket = false): View {
+  const kb = new InlineKeyboard().text("✖️ Cancel", cb("rep", "home"));
+  return {
+    text: [
+      header(viaTicket ? `🎫 ${bold("Raise a support ticket")}` : `🔄 ${bold("Replacement claim")}`),
+      "",
+      `📦 <b>${escapeHtml(label)}</b>`,
+      "",
+      "Step 1 of 2 — describe the problem in one message (e.g. <i>password not working</i>, <i>key already used</i>).",
+      ...(viaTicket ? ["", "<i>Support reads every ticket and replies here.</i>"] : []),
+    ].join("\n"),
+    kb,
+  };
+}
+
+/**
+ * Tapped an item with no warranty (or an expired one). There is deliberately NO
+ * replacement button here — only the honest option: raise a ticket and let
+ * support decide. Promising a replacement we may not give would be worse.
+ */
+export function replaceTicketOfferView(item: ReplaceableItem): View {
+  const kb = new InlineKeyboard()
+    .add(sbtn("🎫 Raise a support ticket", cb("rep", "tkt", item.orderItemId), "success")).row()
+    .text("◀️ Back", cb("rep", "home"));
+  const asIs = !item.warranty;
+  return {
+    text: [
+      header(`🚫 ${bold("No replacement on this item")}`),
+      "",
+      `📦 <b>${escapeHtml(item.label)}</b>`,
+      `🧾 ${escapeHtml(item.orderNumber)}`,
+      "",
+      asIs
+        ? "This product was sold <b>as-is</b>, with no warranty, so an automatic replacement isn't available for it."
+        : `The warranty on this item has <b>expired</b>${item.reason?.includes("Already") ? "" : ""}, so an automatic replacement isn't available.`,
+      ...(item.reason?.startsWith("Already replaced") ? ["", "It has already been replaced once under warranty."] : []),
+      "",
+      "🎫 <b>You can still raise a support ticket.</b>",
+      "Tell us what went wrong and our support team will reply right here. They can help, and they can choose to issue a replacement as a goodwill gesture — that decision is made by a person, not automatically.",
+    ].join("\n"),
+    kb,
+  };
+}
+
+/** A claim is already in the queue — nothing to do but wait. */
+export function replaceBlockedView(item: ReplaceableItem): View {
+  const kb = new InlineKeyboard().text("◀️ Back", cb("rep", "home"));
+  return {
+    text: [
+      header(`⌛ ${bold("Already under review")}`),
+      "",
+      `📦 <b>${escapeHtml(item.label)}</b>`,
+      `🧾 ${escapeHtml(item.orderNumber)}`,
+      "",
+      "Our team is looking at your request right now. You will get a message here as soon as there is news — no need to submit it again. 🙏",
+    ].join("\n"),
+    kb,
+  };
+}
+
+/** The customer's own ticket thread, so support replies live somewhere findable. */
+export async function ticketThreadView(user: BotUser, ticketId: string): Promise<View> {
+  const t = await getMyTicket(user.id, ticketId);
+  const kb = new InlineKeyboard();
+  if (!t) {
+    kb.text("◀️ Support", cb("sup", "home"));
+    return { text: "🎫 Ticket not found.", kb };
+  }
+  const open = t.status !== "CLOSED" && t.status !== "RESOLVED";
+  if (open) kb.add(sbtn("↩️ Reply", cb("tkt", "re", t.id), "success")).row();
+  kb.text("◀️ Support", cb("sup", "home")).row();
+  backToMenuRow(kb);
+  const label: Record<string, string> = { CUSTOMER: "🧑 You", ADMIN: "🎧 Support", SYSTEM: "⚙️" };
+  return {
+    text: [
+      header(`🎫 ${bold(`Ticket ${t.ticketNumber}`)}`),
+      `📌 Status: <b>${t.status.replace(/_/g, " ")}</b>`,
+      ...(t.itemLabel ? [`📦 ${escapeHtml(t.itemLabel)}${t.orderNumber ? ` · ${escapeHtml(t.orderNumber)}` : ""}`] : []),
+      "",
+      ...t.messages.slice(-12).map((m) =>
+        `${label[m.authorType] ?? ""} <i>${m.createdAt.toISOString().slice(5, 16).replace("T", " ")}</i>\n${escapeHtml(m.body).slice(0, 500)}${m.proofFileId ? "\n📷 <i>screenshot attached</i>" : ""}\n`,
+      ),
+      open ? "<i>Tap ↩️ Reply to add to this ticket.</i>" : "<i>This ticket is closed. Open a new one any time.</i>",
+    ].join("\n"),
+    kb,
+  };
+}
+
+/** 🏆 My Tier — real lifetime spend, next tier, and any gifts. */
+export async function tierView(user: BotUser): Promise<View> {
+  const [st, tiers] = await Promise.all([tierOf(user.id), getTiers()]);
+  const bar = (pct: number): string => "█".repeat(Math.round(pct / 10)).padEnd(10, "░");
+  const kb = new InlineKeyboard();
+  kb.add(sbtn("🎡 Spin for a challenge", cb("spn", "home"), "success")).row();
+  navRow(kb, cb("prf", "view"));
+  return {
+    text: [
+      header(`🏆 ${bold("My Tier")}`),
+      "",
+      `Your tier: <b>${st.tier.name}</b> — ${escapeHtml(st.tier.perk)}`,
+      `💰 Lifetime spend: <b>${fmt(st.spendMinor, st.currency)}</b>`,
+      "",
+      st.next
+        ? `${bar(st.progressPct)} ${st.progressPct}%\n📈 Spend <b>${fmt(st.toNextMinor, st.currency)}</b> more to reach <b>${st.next.name}</b>`
+        : "👑 <b>You are at the top tier.</b> Thank you!",
+      "",
+      HR,
+      "<b>All tiers</b>",
+      ...tiers.map((t) => `${t.name === st.tier.name ? "▶️" : "  "} <b>${t.name}</b> — from ${fmt(t.minSpendMinor, st.currency)} · ${escapeHtml(t.perk)}`),
+    ].join("\n"),
+    kb,
+  };
+}
+
+/** 🎡 Spin & Win — one spin per purchase, explained. */
+export async function spinView(user: BotUser): Promise<View> {
+  const [cfg, mission] = await Promise.all([getSpinConfig(), activeChallenge(user.id)]);
+  const kb = new InlineKeyboard();
+  if (mission) kb.add(sbtn("🎯 Open my Mission", cb("msn", "home"), "primary")).row();
+  else kb.add(sbtn("🎯 Try a Mission instead", cb("msn", "home"), "primary")).row();
+  navRow(kb, cb("prf", "view"));
+  if (!cfg.enabled) {
+    return { text: `${header(`🎡 ${bold("Spin & Win")}`)}\n\nNot running right now — check back soon!`, kb };
+  }
+  return {
+    text: [
+      header(`🎡 ${bold("Spin & Win")}`),
+      "",
+      "🎁 <b>Every purchase earns a spin.</b>",
+      "",
+      `• Orders of <b>${fmt(cfg.minSpendMinor, user.currency as Currency)}</b> or more can win`
+        + ` up to <b>${fmt(cfg.maxRewardMinor, user.currency as Currency)}</b> in wallet credit`,
+      "• Smaller orders get a “better luck next time”",
+      `• Up to <b>${cfg.maxSpinsPerDay}</b> spins a day`,
+      "",
+      mission
+        ? "⚠️ <b>You're on a Mission right now</b>, so spins are paused. Finish or let it expire to spin again."
+        : "👉 Your spin button appears right after you pay. 🛍",
+    ].join("\n"),
+    kb,
+  };
+}
+
+/** 🎯 Missions — the spend challenge (bigger reward, one at a time). */
+export async function missionView(user: BotUser): Promise<View> {
+  const [cfg, active] = await Promise.all([getSpinConfig(), activeChallenge(user.id)]);
+  const kb = new InlineKeyboard();
+  if (!cfg.enabled) {
+    navRow(kb, cb("prf", "view"));
+    return { text: `${header(`🎯 ${bold("Missions")}`)}\n\nNot running right now — check back soon!`, kb };
+  }
+  if (!active) {
+    kb.add(sbtn("🎯 Start a Mission", cb("msn", "go"), "success")).row();
+    kb.add(sbtn("🎡 Or spin per purchase", cb("spn", "home"), "primary")).row();
+    navRow(kb, cb("prf", "view"));
+    return {
+      text: [
+        header(`🎯 ${bold("Missions")}`),
+        "",
+        "Take on a <b>spending target</b> and earn a bigger reward when you reach it. 💪",
+        "",
+        `🎁 Rewards go up to <b>${(cfg.rewardBp / 100).toFixed(1)}%</b> of the target.`,
+        `⏳ You get <b>${cfg.expiryDays} days</b> to finish.`,
+        "",
+        "⚠️ <b>While a Mission is running, per-purchase spins are paused</b> — one reward path at a time.",
+        "",
+        "<i>Only spending after you start counts.</i>",
+      ].join("\n"),
+      kb,
+    };
+  }
+  const bar = "█".repeat(Math.round(active.pct / 10)).padEnd(10, "░");
+  if (active.claimable) kb.add(sbtn(`🎉 Claim ${fmt(active.rewardMinor, active.currency)}`, cb("msn", "claim", active.id), "success")).row();
+  else kb.add(sbtn("🛍 Shop now", cb("shp", "home", 1), "primary")).row();
+  navRow(kb, cb("prf", "view"));
+  return {
+    text: [
+      header(`🎯 ${bold("Your Mission")}`),
+      "",
+      `🎯 Spend <b>${fmt(active.targetMinor, active.currency)}</b>`,
+      `🎁 Earn <b>${fmt(active.rewardMinor, active.currency)}</b> wallet credit`,
+      "",
+      `${bar} <b>${active.pct}%</b>`,
+      `✅ Done: <b>${fmt(active.progressMinor, active.currency)}</b>`,
+      active.claimable ? "\n🎉 <b>Complete — claim your reward!</b>" : `⏳ <b>${fmt(active.remainingMinor, active.currency)}</b> to go`,
+      `📅 Expires ${active.expiresAt.toISOString().slice(0, 10)}`,
+      "",
+      "<i>Spins are paused while a Mission is active.</i>",
+    ].join("\n"),
+    kb,
+  };
+}
+
+
+/** 🔔 My watchlist — what they asked to be told about. */
+export async function watchlistView(user: BotUser): Promise<View> {
+  const rows = await listWatches(user.id);
+  const kb = new InlineKeyboard();
+  for (const w of rows) {
+    kb.text(`${w.type === "RESTOCK" ? "🔔" : "📉"} ${clip(w.name, 22)}`, cb("shp", "prod", w.productId)).row();
+  }
+  if (rows.length > 0) kb.add(sbtn("🧹 Clear all", cb("wch", "clear"), "danger")).row();
+  navRow(kb, cb("prf", "view"));
+  return {
+    text: rows.length
+      ? [
+          header(`🔔 ${bold("My Watchlist")}`),
+          "",
+          "We'll message you the moment any of these happen:",
+          "",
+          ...rows.map((w) =>
+            w.type === "RESTOCK"
+              ? `🔔 <b>${escapeHtml(w.name)}</b> — when back in stock`
+              : `📉 <b>${escapeHtml(w.name)}</b> — if it drops below ${w.basePriceMinor !== null ? fmt(w.basePriceMinor, (w.currency ?? user.currency) as Currency) : "the price you saw"}`,
+          ),
+          "",
+          "<i>Tap any item to open it. You're told once, then it comes off the list.</i>",
+        ].join("\n")
+      : `${header(`🔔 ${bold("My Watchlist")}`)}\n\nNothing yet.\n\nOn any product, tap <b>📉 Tell me if the price drops</b> — or <b>🔔 Notify me</b> when something is sold out — and it appears here.`,
+    kb,
+  };
+}
+
+/** 🎯 Today's deals — sale, restocked and new in one place. */
+export async function dealsView(user: BotUser): Promise<View> {
+  const items = await todaysDeals(user.currency as Currency, 12);
+  const kb = new InlineKeyboard();
+  for (const d of items) {
+    const tag = d.tag === "SALE" ? "🔥" : d.tag === "NEW" ? "🆕" : "🔔";
+    const price = d.fromPriceMinor === null ? "—" : fmt(d.fromPriceMinor, user.currency);
+    kb.add(sbtn(`${tag} ${clip(withIcon(d.iconEmoji, d.name), 24)} — ${price}`, cb("shp", "prod", d.id), d.tag === "SALE" ? "danger" : "success")).row();
+  }
+  kb.add(sbtn("🛍 All products", cb("shp", "home", 1), "primary")).row();
+  navRow(kb, cb("mnu", "home"));
+  return {
+    text: items.length
+      ? [
+          header(`🎯 ${bold("Today's Deals")}`),
+          "",
+          "🔥 on sale   ·   🔔 just restocked   ·   🆕 new arrival",
+          "",
+          ...items.map((d) => {
+            const now = d.fromPriceMinor === null ? "—" : fmt(d.fromPriceMinor, user.currency);
+            return d.wasMinor !== null
+              ? `🔥 <b>${escapeHtml(d.name)}</b> — <s>${fmt(d.wasMinor, user.currency)}</s> <b>${now}</b>`
+              : `${d.tag === "NEW" ? "🆕" : "🔔"} <b>${escapeHtml(d.name)}</b> — ${now}`;
+          }),
+          "",
+          "<i>Deals move fast — grab them while they're here.</i>",
+        ].join("\n")
+      : `${header(`🎯 ${bold("Today's Deals")}`)}\n\nNo special deals right now — but the shop is full of good prices. 🛍`,
+    kb,
+  };
+}
+
+/** 🔑 Search my keys. */
+export async function myKeysSearchView(user: BotUser, query: string): Promise<View> {
+  const rows = await searchMyKeys(user.id, query, 12);
+  const kb = new InlineKeyboard();
+  for (const r of rows) kb.text(`🔑 ${r.productName.slice(0, 24)} · ${r.orderNumber}`, cb("lic", "view", r.orderItemId)).row();
+  kb.add(sbtn("🔍 Search again", cb("lic", "find"), "primary")).row();
+  navRow(kb, cb("prf", "view"));
+  return {
+    text: rows.length
+      ? [header(`🔑 ${bold("Your keys")}`), "", `Found <b>${rows.length}</b> matching “${escapeHtml(query)}”.`, "", "Tap one to see or re-copy it."].join("\n")
+      : `${header(`🔑 ${bold("Your keys")}`)}\n\nNothing matched “${escapeHtml(query)}”.\n\nTry part of the product name, e.g. <code>netflix</code>.`,
+    kb,
+  };
+}
+
+
+/**
+ * Crypto network picker — one button per network the admin enabled and the
+ * merchant account accepts. `mode` decides what the tap does: pay an order
+ * (optionally with the wallet first) or fund the wallet.
+ */
+export async function cryptoNetworkView(user: BotUser, mode: { kind: "order"; useWallet?: boolean; payableMinor?: number } | { kind: "topup"; amountMinor: number }): Promise<View> {
+  const nets = await availableCryptoNetworks();
+  const amountLine = mode.kind === "topup"
+    ? `💰 Deposit: <b>${fmt(mode.amountMinor, user.currency)}</b>`
+    : "";
+  const lines = [
+    header(`${e("crypto")} ${bold(mode.kind === "topup" ? "Choose a payment method" : "Choose a payment network")}`),
+    "",
+    amountLine,
+    mode.kind === "topup" ? "Select a payment method to add funds to your wallet:" : "Pick the <b>network</b> you will send from. You get a <b>fresh address just for this payment</b> — send the exact amount shown and it confirms automatically.",
+    "",
+    ...(nets.length > 0 ? [
+      "💡 <b>USDT</b> = no price swings. Cheapest fees: BEP20, TRC20, Solana, TON.",
+      "⚠️ Send on the <b>same network</b> you pick here — a different network loses the funds.",
+    ] : []),
+  ].filter((l) => l !== "");
+  const kb = new InlineKeyboard();
+  const w = mode.kind === "order" && mode.useWallet ? ["w"] : [];
+  const data = (code: string) => mode.kind === "topup" ? cb("wal", "cryptonet", code) : cb("ord", "cryptonet", code, ...w);
+  // Catalogue order = popularity order (BEP20, TRC20, Solana, LTC, TON, …).
+  let i = 0;
+  // A premium coin logo (🎨 Custom Emoji → "usdt", "tron", "ton", …) becomes
+  // the button's animated icon; without one the plain glyph is shown.
+  for (const n of nets) {
+    const icon = networkIconId(n.code);
+    kb.add(sbtn(icon ? n.label : `${n.emoji} ${n.label}`, data(n.code), n.stable ? "success" : "primary", icon));
+    if (++i % 2 === 0) kb.row();
+  }
+  if (i % 2 === 1) kb.row();
+  // The other rails live here too, so a customer never has to go back to
+  // find Binance Pay or UPI.
+  const binanceOn = await binanceOffered().catch(() => false);
+  const upiOn = (user.currency as string) === "INR" && (await upiOffered(mode.kind === "order" ? mode.payableMinor : undefined).catch(() => ({ ok: false }))).ok;
+  if (mode.kind === "order") {
+    if (binanceOn) kb.add(sbtn("🪙 Binance Pay (USDT) ⚡", cb("ord", "paybinance", ...w), "success")).row();
+    if (upiOn) kb.add(sbtn("🇮🇳 UPI (INR)", cb("ord", "payupi", ...w), "primary")).row();
+    if (listEnabledProviders(user.currency).some((p) => p.id === "nowpayments")) {
+      kb.text("🪙 Other coins — open invoice page", cb("ord", "paygw", "nowpayments")).row();
+    }
+  } else {
+    if (binanceOn) kb.add(sbtn("🪙 Deposit via Binance Pay", cb("wal", "topup"), "success")).row();
+    if (upiOn) kb.add(sbtn("🇮🇳 Deposit via UPI", cb("wal", "topupinr"), "primary")).row();
+  }
+  navRow(kb, mode.kind === "topup" ? cb("wal", "view") : cb("crt", "checkout"));
+  return { text: lines.join("\n"), kb };
+}
+
+
+/** One FAQ answer, with the way back to Help / Support. */
+export async function faqAnswerView(id: string): Promise<View | null> {
+  const f = (await listFaq()).find((x) => x.id === id);
+  if (!f) return null;
+  const kb = new InlineKeyboard()
+    .text("❓ More answers", cb("hlp", "home")).text("💬 Still need help", cb("sup", "chat")).row();
+  backToMenuRow(kb);
+  return { text: [`❓ <b>${escapeHtml(f.q)}</b>`, "", f.a].join("\n"), kb };
+}

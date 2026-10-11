@@ -1,0 +1,390 @@
+import { loadConfig } from "@gis/config";
+import { getRedis } from "./redis.js";
+import { Queue } from "bullmq";
+import { Redis } from "ioredis";
+
+/**
+ * BullMQ queue contracts (Architecture doc §3.4). Producers live in core/api,
+ * consumers in apps/worker. Job ids provide dedupe where noted.
+ */
+export const QUEUE_NAMES = {
+  fulfillment: "fulfillment",
+  outbox: "outbox",
+  email: "email",
+} as const;
+
+export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
+
+export interface FulfillmentJob {
+  webhookEventId: string;
+}
+export interface OutboxButton {
+  text: string;
+  url?: string;
+  callbackData?: string;
+  /** One-tap clipboard copy (Telegram copy_text button). */
+  copyText?: string;
+  style?: "primary" | "success" | "danger";
+  /**
+   * Custom (premium) emoji shown as the button's icon — Bot API 9.4
+   * `icon_custom_emoji_id`. Button LABELS are plain text and can never contain a
+   * custom emoji, so this field is the only way to get one onto a button; the
+   * in-bot shop already uses it (sbtn), broadcasts now do too.
+   * Telegram renders it only for bots allowed to use custom emoji at all.
+   */
+  iconCustomEmojiId?: string;
+}
+export interface OutboxJob {
+  telegramId: string;
+  text: string;
+  /** Delete this message instead of sending anything (payment prompts, once the order is done). */
+  deleteMessageId?: number;
+  /**
+   * Tidy this message away N seconds after it is sent. For the standalone
+   * celebration emoji: it plays its animation, then stops sitting between the
+   * customer and their keys. The worker knows the message id, so this is the
+   * one clean way to schedule it.
+   */
+  deleteAfterSec?: number;
+  photo?: string; // optional image URL → sent as photo with text as caption
+  buttons?: OutboxButton[]; // optional inline call-to-action buttons (URL buttons)
+  pin?: boolean; // pin the sent message in the chat
+  document?: { filename: string; content: string }; // optional .txt attachment; text becomes the caption
+  /**
+   * A second, separate message sent right after this one, in order. Used for
+   * a delivery: the credentials message carries only copy buttons, and the
+   * navigation (My orders / Buy more / Menu) rides here — so tapping a button
+   * can never edit the credentials away. Views replace the message they were
+   * tapped on; a delivery must never be that message.
+   */
+  followUp?: { text: string; buttons?: OutboxButton[] };
+}
+export interface OutboxOptions {
+  photo?: string;
+  buttons?: OutboxButton[];
+  followUp?: { text: string; buttons?: OutboxButton[] };
+  pin?: boolean;
+  /** Self-delete this message N seconds after sending (see OutboxJob). */
+  deleteAfterSec?: number;
+  /** Send later (ms). Used by the after-sale follow-up. */
+  delayMs?: number;
+}
+export interface EmailJob {
+  to: string;
+  subject: string;
+  html: string;
+}
+
+const globalForQueues = globalThis as unknown as {
+  __gisQueueConn?: Redis;
+  __gisQueues?: Map<QueueName, Queue>;
+};
+
+export function getQueueConnection(): Redis {
+  if (!globalForQueues.__gisQueueConn) {
+    globalForQueues.__gisQueueConn = new Redis(loadConfig().REDIS_URL, {
+      maxRetriesPerRequest: null,
+    });
+  }
+  return globalForQueues.__gisQueueConn;
+}
+
+export function getQueue(name: QueueName): Queue {
+  globalForQueues.__gisQueues ??= new Map();
+  let q = globalForQueues.__gisQueues.get(name);
+  if (!q) {
+    q = new Queue(name, {
+      connection: getQueueConnection(),
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: { type: "exponential", delay: 3000 },
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
+      },
+    });
+    globalForQueues.__gisQueues.set(name, q);
+  }
+  return q;
+}
+
+/** Dedupe: one fulfillment job per webhook event. */
+export async function enqueueFulfillment(webhookEventId: string): Promise<void> {
+  await getQueue(QUEUE_NAMES.fulfillment).add(
+    "process",
+    { webhookEventId } satisfies FulfillmentJob,
+    { jobId: `wh:${webhookEventId}` },
+  );
+}
+
+/** All outbound Telegram messages flow through this throttled queue (§3.3). */
+export async function enqueueTelegramMessage(
+  telegramId: bigint | string,
+  text: string,
+  opts: OutboxOptions = {},
+): Promise<void> {
+  await getQueue(QUEUE_NAMES.outbox).add("send", {
+    telegramId: telegramId.toString(),
+    text,
+    ...(opts.photo ? { photo: opts.photo } : {}),
+    ...(opts.buttons && opts.buttons.length > 0 ? { buttons: opts.buttons } : {}),
+    ...(opts.followUp ? { followUp: opts.followUp } : {}),
+    ...(opts.pin ? { pin: true } : {}),
+    ...(opts.deleteAfterSec ? { deleteAfterSec: opts.deleteAfterSec } : {}),
+  } satisfies OutboxJob, opts.delayMs && opts.delayMs > 0 ? { delay: Math.min(opts.delayMs, 7 * 24 * 3600_000) } : undefined);
+}
+
+/**
+ * Bulk enqueue for fan-out (broadcasts, catalogue posts).
+ *
+ * One pipelined addBulk per chunk instead of one round trip per recipient — a
+ * 10k broadcast was ~30-50k serialized Redis commands on the same connection the
+ * bot reads sessions from, so every button tap queued behind the blast.
+ *
+ * `priority` is set LOW (higher number = lower priority in BullMQ) so a marketing
+ * send can never delay a paid customer's license key on the shared outbox queue.
+ */
+export async function enqueueTelegramBulk(
+  jobs: Array<{ telegramId: bigint | string; text: string; opts?: OutboxOptions }>,
+  chunkSize = 500,
+): Promise<number> {
+  const q = getQueue(QUEUE_NAMES.outbox);
+  let queued = 0;
+  for (let i = 0; i < jobs.length; i += chunkSize) {
+    const slice = jobs.slice(i, i + chunkSize);
+    await q.addBulk(
+      slice.map((j) => ({
+        name: "send",
+        data: {
+          telegramId: j.telegramId.toString(),
+          text: j.text,
+          ...(j.opts?.photo ? { photo: j.opts.photo } : {}),
+          ...(j.opts?.buttons && j.opts.buttons.length > 0 ? { buttons: j.opts.buttons } : {}),
+          ...(j.opts?.pin ? { pin: true } : {}),
+        } satisfies OutboxJob,
+        opts: { priority: 10 },
+      })),
+    );
+    queued += slice.length;
+  }
+  return queued;
+}
+
+/**
+ * Delete a message the bot sent earlier. Goes through the outbox because the
+ * services that finish an order (webhooks, cron, the admin panel) run in the
+ * worker and have no grammY context of their own.
+ *
+ * Telegram only lets a bot delete its own message for 48 hours; past that the
+ * call fails and the worker drops it, which is the right outcome — there is
+ * nothing to clean up that the customer still cares about.
+ */
+export async function enqueueTelegramDelete(telegramId: bigint | string, messageId: number, delayMs = 0): Promise<void> {
+  await getQueue(QUEUE_NAMES.outbox).add("send", {
+    telegramId: telegramId.toString(),
+    text: "",
+    deleteMessageId: messageId,
+  } satisfies OutboxJob, { priority: 20, ...(delayMs > 0 ? { delay: delayMs } : {}) });
+}
+
+/** Send a text file (e.g. a large order's keys) as a Telegram document, with a caption. */
+export async function enqueueTelegramDocument(
+  telegramId: bigint | string,
+  filename: string,
+  content: string,
+  caption: string,
+  buttons?: OutboxButton[],
+  followUp?: { text: string; buttons?: OutboxButton[] },
+): Promise<void> {
+  await getQueue(QUEUE_NAMES.outbox).add("send", {
+    telegramId: telegramId.toString(),
+    text: caption,
+    document: { filename, content },
+    ...(buttons && buttons.length > 0 ? { buttons } : {}),
+    ...(followUp ? { followUp } : {}),
+  } satisfies OutboxJob);
+}
+
+/** Shown under every delivery: jump to orders, or straight back to the shop. */
+export const DELIVERY_BUTTONS: OutboxButton[] = [
+  { text: "📦 View my orders", callbackData: "ord:list:1", style: "primary" },
+  { text: "🛍 Buy more", callbackData: "shp:home:1", style: "success" },
+];
+
+/**
+ * The navigation that used to sit under a delivery. It now goes in its own
+ * message (OutboxJob.followUp): a button tap replaces the message it is on
+ * with the next screen, which erased the customer's keys from the chat.
+ */
+export const DELIVERY_FOLLOWUP = {
+  text: "✅ <b>Delivered.</b> Your items are in the message above and always in 📦 My Orders.",
+  buttons: DELIVERY_BUTTONS,
+};
+
+/**
+ * Telegram's hard limit on a copy_text button payload (Bot API: 1-256 chars).
+ * Exceeding it makes Telegram reject the ENTIRE sendMessage with 400 — so a
+ * long delivered value (e.g. a 380-character sign-in link) used to take the
+ * whole delivery message down with it and the paid customer received nothing
+ * in chat, with the value only reachable through 📦 My Orders.
+ */
+export const TELEGRAM_COPY_TEXT_MAX = 256;
+
+/** A value can only ride in a copy_text button when Telegram will accept it. */
+export function isCopyable(value: string | undefined): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= TELEGRAM_COPY_TEXT_MAX;
+}
+
+/**
+ * Delivery buttons with one-tap copy for the credentials that were delivered.
+ * Pass the already-repaired values so the clipboard matches what is displayed.
+ *
+ * Values too long for a copy_text button are simply not given one — the value
+ * itself is always in the message body, where it can be tapped to copy.
+ */
+export function deliveryButtons(creds?: { id?: string; pw?: string; twofa?: string; key?: string }, ref?: { orderId: string }): OutboxButton[] {
+  const out: OutboxButton[] = [];
+  if (isCopyable(creds?.id)) out.push({ text: "📋 Copy ID", copyText: creds.id });
+  if (isCopyable(creds?.pw)) out.push({ text: "📋 Copy password", copyText: creds.pw });
+  if (isCopyable(creds?.twofa)) out.push({ text: "📋 Copy 2FA secret", copyText: creds.twofa });
+  if (creds?.id && creds.pw) {
+    const all = `${creds.id}|${creds.pw}${creds.twofa ? `|${creds.twofa}` : ""}`;
+    if (isCopyable(all)) out.push({ text: "📋 Copy ALL credentials", copyText: all });
+    else if (ref) out.push({ text: "📋 Copy ALL credentials", callbackData: `dl:copyall:${ref.orderId}` });
+  } else if (isCopyable(creds?.key)) {
+    out.push({ text: "📋 Copy key", copyText: creds.key });
+  } else if (creds?.key && ref) {
+    // Too long for copy_text (a long activation link): the bot answers the
+    // tap with the value alone in a tap-to-copy code block.
+    out.push({ text: "📋 Copy link", callbackData: `dl:copy:${ref.orderId}:1` });
+  }
+  // Copy buttons only — navigation goes in DELIVERY_FOLLOWUP, a separate message.
+  return out;
+}
+
+export async function enqueueEmail(job: EmailJob): Promise<void> {
+  await getQueue(QUEUE_NAMES.email).add("send", job);
+}
+
+/** Redis set of Telegram IDs currently logged in to the in-bot admin panel. */
+export const BOT_ADMIN_MEMBERS_KEY = "botadmin:members";
+
+/**
+ * Alert admins (best-effort): the configured ADMIN_ALERT_CHAT_ID plus every
+ * admin currently logged in to the in-bot panel, each de-duplicated.
+ */
+export async function enqueueAdminAlert(text: string, buttons?: OutboxButton[], photo?: string): Promise<void> {
+  const sent = new Set<string>();
+  // `photo`: a Telegram file_id (e.g. a customer's screenshot) sent with the alert as its caption.
+  const opts = { ...(buttons && buttons.length > 0 ? { buttons } : {}), ...(photo ? { photo } : {}) };
+  const cfg = loadConfig();
+  const chatId = cfg.ADMIN_ALERT_CHAT_ID;
+  if (chatId) { await enqueueTelegramMessage(chatId, text, opts); sent.add(String(chatId)); }
+  // Always reach the configured admin Telegram IDs (works even if they never opened the panel).
+  for (const id of (cfg.BOT_ADMIN_IDS ?? "").split(",").map((x) => x.trim()).filter(Boolean)) {
+    if (!sent.has(id)) { await enqueueTelegramMessage(id, text, opts); sent.add(id); }
+  }
+  try {
+    const members = await getRedis().smembers(BOT_ADMIN_MEMBERS_KEY);
+    for (const m of members) {
+      if (m && !sent.has(m)) { await enqueueTelegramMessage(m, text, opts); sent.add(m); }
+    }
+  } catch {
+    // Redis unavailable — the configured channel/ids (if any) still got it.
+  }
+}
+
+/** Telegram's hard cap on one text message. */
+export const TELEGRAM_TEXT_MAX = 4096;
+
+/** The inline tags Telegram actually understands — everything else is content. */
+const TG_TAGS = "b|strong|i|em|u|ins|s|strike|del|a|code|pre|span|tg-spoiler|tg-emoji|blockquote";
+const TG_TAG_RE = new RegExp(`</?(?:${TG_TAGS})(?:\\s[^<>]*)?>`, "gi");
+
+/**
+ * Strip Telegram markup and undo the entity escaping, leaving the CONTENT.
+ *
+ * A blanket `<[^>]+>` strip cannot be used here: a license key like
+ * `ABCD-<XY>-Z` is legitimate content and would be eaten, handing the customer
+ * a corrupted key. So only the tags Telegram defines are removed, and only then
+ * are `&amp;`/`&lt;`/`&gt;`/`&quot;` turned back into the characters the
+ * customer is supposed to see.
+ */
+export function stripTelegramHtml(html: string): string {
+  return html
+    .replace(TG_TAG_RE, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/**
+ * Shorten Telegram HTML to `max` characters without cutting a tag in half
+ * (a photo caption is capped at 1024). Slicing the raw string cut through
+ * `<a href=…>` or `<tg-emoji …>`, Telegram refused the whole caption and the
+ * fallback dropped the photo and the buttons.
+ */
+export function capTelegramHtml(html: string, max: number, tail = "…"): string {
+  if (html.length <= max) return html;
+  const first = splitTelegramHtml(html, Math.max(16, max - tail.length))[0] ?? "";
+  return `${first}${tail}`;
+}
+
+/** Tags that may legitimately stay open across a line (everything but <a>/<tg-emoji>). */
+const REOPENABLE = ["blockquote", "pre", "code", "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "span", "tg-spoiler"];
+
+/**
+ * Split an HTML message into Telegram-sized parts WITHOUT cutting a tag in half.
+ *
+ * Slicing every 4000 characters is what produced `...">Tap here to open your
+ * link</a></b>` in a customer's chat: the cut landed inside an anchor, Telegram
+ * rejected the part as unparseable, and the fallback then posted the raw markup.
+ * Splitting on line boundaries keeps every tag whole, and any formatting still
+ * open at a cut is closed and reopened so each part parses on its own.
+ */
+export function splitTelegramHtml(html: string, max = TELEGRAM_TEXT_MAX): string[] {
+  if (html.length <= max) return [html];
+  const parts: string[] = [];
+  let buf = "";
+  let open: string[] = [];
+
+  const openTagsOf = (chunk: string): string[] => {
+    const stack: string[] = [];
+    for (const m of chunk.matchAll(new RegExp(`</?(${TG_TAGS})(?:\\s[^<>]*)?>`, "gi"))) {
+      const name = (m[1] ?? "").toLowerCase();
+      if (!REOPENABLE.includes(name)) continue;
+      if (m[0]!.startsWith("</")) { const i = stack.lastIndexOf(name); if (i >= 0) stack.splice(i, 1); }
+      else stack.push(name);
+    }
+    return stack;
+  };
+
+  const flush = (): void => {
+    if (!buf) return;
+    const stillOpen = openTagsOf(`${open.map((t) => `<${t}>`).join("")}${buf}`);
+    parts.push(`${open.map((t) => `<${t}>`).join("")}${buf}${[...stillOpen].reverse().map((t) => `</${t}>`).join("")}`);
+    open = stillOpen;
+    buf = "";
+  };
+
+  for (const line of html.split("\n")) {
+    // A single line longer than the cap has no safe tag boundary — hand it to
+    // the caller as plain content rather than emitting a part that cannot parse.
+    if (line.length > max) {
+      flush();
+      const plain = stripTelegramHtml(line);
+      // Re-escaped: every caller sends these parts with parse_mode HTML, so a
+      // bare "<" or "&" left in the plain text made Telegram reject the part.
+      // (Telegram counts the PARSED length, so escaping does not overflow it.)
+      const esc = (x: string) => x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      for (let i = 0; i < plain.length; i += max) parts.push(esc(plain.slice(i, i + max)));
+      continue;
+    }
+    const reopenCost = open.reduce((n, t) => n + t.length * 2 + 5, 0);
+    if (buf && reopenCost + buf.length + 1 + line.length > max) flush();
+    buf = buf ? `${buf}\n${line}` : line;
+  }
+  flush();
+  return parts.filter((p) => p.trim() !== "");
+}

@@ -1,0 +1,302 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dealnity Store — production stack (single Hostinger VPS KVM 8: 8 vCPU / 32 GB).
+#
+# ALWAYS run from the REPO ROOT so variable interpolation reads the root .env:
+#
+#   docker compose --env-file .env -f infrastructure/docker/compose.prod.yml up -d
+#
+# (infrastructure/scripts/deploy.sh wraps this.) Only nginx publishes ports;
+# everything else talks over the internal network. See docs/deployment/production.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: gis
+
+x-defaults: &defaults
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging: &default-logging
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "3"
+  networks:
+    - internal
+
+services:
+  # ── Edge ───────────────────────────────────────────────────────────────────
+  nginx:
+    <<: *defaults
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/gis.rendered.conf:/etc/nginx/conf.d/gis.conf:ro
+      - ../nginx/landing.rendered:/usr/share/nginx/landing:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+      - media_data:/data/media:ro
+    depends_on:
+      - bot
+    # Reload every 6h so renewed certificates get picked up.
+    command: >
+      /bin/sh -c "while :; do sleep 6h & wait $${!}; nginx -s reload; done
+      & exec nginx -g 'daemon off;'"
+    healthcheck:
+      # Must actually hit the listener: `nginx -t` only parses the config and
+      # returns 0 even when the worker processes are gone.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  certbot:
+    <<: *defaults
+    image: certbot/certbot:latest
+    volumes:
+      - certbot_certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    # Webroot renewal loop (initial issuance is a one-shot bootstrap command —
+    # see docs/deployment/production.md §6).
+    entrypoint: >
+      /bin/sh -c "trap exit TERM; while :; do
+      certbot renew --webroot -w /var/www/certbot --quiet;
+      sleep 12h & wait $${!}; done"
+
+  # ── Data stores ────────────────────────────────────────────────────────────
+  postgres:
+    <<: *defaults
+    image: postgres:16-alpine
+    shm_size: 1g
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-gis}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=4GB
+      - -c
+      - effective_cache_size=12GB
+      - -c
+      - max_connections=200
+      - -c
+      - wal_compression=on
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gis} -d ${POSTGRES_DB:-gis}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+
+  redis:
+    <<: *defaults
+    image: redis:7-alpine
+    # noeviction: BullMQ job data must never be silently evicted.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 2gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+
+  # ── One-shot: migrations + seed (gates app startup) ───────────────────────
+  migrate:
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - internal
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.node
+      args:
+        APP: "@gis/database"
+    env_file: ../../.env
+    environment:
+      NODE_ENV: production
+    # Migrations, when packages/database/prisma/migrations exists, are the only
+    # reviewable path: `migrate deploy` replays exactly what was committed.
+    # Until a baseline migration is generated (`pnpm db:migrate --name init`) we
+    # fall back to `db push` WITHOUT --accept-data-loss: a schema change that
+    # would drop a column now aborts the deploy instead of silently destroying
+    # production data.
+    command: >
+      sh -c "if [ -d packages/database/prisma/migrations ]; then
+      pnpm --filter @gis/database exec prisma migrate deploy;
+      else echo '=== WARNING: no migrations directory — falling back to db push ===';
+      pnpm --filter @gis/database exec prisma db push --skip-generate; fi
+      && echo '=== SCHEMA SYNCED OK ==='
+      && (pnpm --filter @gis/database db:seed && echo '=== SEED OK ===' || echo '=== SEED SKIPPED (non-fatal) ===')"
+    restart: "no"
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Applications ───────────────────────────────────────────────────────────
+  # Ensures the media volume is writable by the non-root "node" user (uid 1000)
+  # on every deploy. Fixes uploads failing with EACCES on a fresh root-owned volume.
+  # Not profile-gated: the bot stores admin-sent product photos here too (the
+  # Mini App needs a real URL, a Telegram file_id cannot be shown on a web page).
+  media-init:
+    <<: *defaults
+    image: alpine:3.20
+    volumes:
+      - media_data:/data/media
+    command: sh -c "mkdir -p /data/media && chown -R 1000:1000 /data/media"
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  api:
+    <<: *defaults
+    # Activates when the app ships: docker compose --profile full up -d
+    profiles: ["full"]
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.node
+      args:
+        APP: "@gis/api"
+    env_file: ../../.env
+    environment:
+      NODE_ENV: production
+      # JWT_SECRET is optional in the shared config schema (the bot and worker
+      # do not need it). A `${JWT_SECRET:?}` guard here would be the natural
+      # fix, but compose interpolates the whole file BEFORE profiles apply, so
+      # it would refuse to start the bot-only stack too. The check lives in
+      # deploy.sh (only when deploying `full`) and in the API's own bootstrap,
+      # which exits with a clear message instead of serving a broken login.
+      JWT_SECRET: ${JWT_SECRET:-}
+      # The API reads API_PORT (packages/config), not PORT. Pinning it here keeps
+      # the container in sync with the healthcheck and the nginx upstream even if
+      # .env sets a different API_PORT.
+      API_PORT: 8080
+      MEDIA_DIR: /data/media
+    volumes:
+      - media_data:/data/media
+    healthcheck:
+      test: ["CMD-SHELL", "node -e 'require(\"http\").get({host:\"127.0.0.1\",port:8080,path:\"/api/v1/health\"},r=>process.exit(r.statusCode===200?0:1)).on(\"error\",()=>process.exit(1))'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      media-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  bot:
+    <<: *defaults
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.node
+      args:
+        APP: "@gis/telegram-bot"
+    env_file: ../../.env
+    environment:
+      NODE_ENV: production
+      BOT_MODE: webhook
+      PORT: 8081
+      MEDIA_DIR: /data/media
+    volumes:
+      - media_data:/data/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      media-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  worker:
+    <<: *defaults
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.node
+      args:
+        APP: "@gis/worker"
+    env_file: ../../.env
+    environment:
+      NODE_ENV: production
+      PORT: 8082 # payment webhook receiver + /health (image healthcheck uses it)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  admin:
+    <<: *defaults
+    # Activates when the app ships: docker compose --profile full up -d
+    profiles: ["full"]
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.admin
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL in .env}
+    env_file: ../../.env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    depends_on:
+      api:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  certbot_certs:
+  certbot_www:
+  media_data:

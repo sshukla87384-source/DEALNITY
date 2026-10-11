@@ -1,0 +1,765 @@
+import type { Currency, Prisma } from "@gis/database";
+import { loadConfig } from "@gis/config";
+import { convertMinor, convertPriceMinor } from "../fx.js";
+import { CoreError, decryptSecret, effectiveHours, encryptSecret } from "@gis/shared";
+import { isCopyable, type OutboxButton } from "../queues.js";
+import { effectivePriceMinor } from "../pricing.js";
+
+/**
+ * Shared inventory-assignment primitives used by BOTH the wallet checkout and
+ * webhook fulfillment (Security doc §5). All selects use FOR UPDATE SKIP LOCKED
+ * inside the caller's transaction; the UNIQUE orderItemId constraints make
+ * duplicate delivery impossible at the database level.
+ */
+
+export type Tx = Prisma.TransactionClient;
+
+export interface PricedLine {
+  variantId: string;
+  productId: string;
+  /** The product's category, so a CATEGORY-scoped coupon can match this line. */
+  categoryId: string;
+  productName: string;
+  variantName: string;
+  productType: string;
+  activationGuide: string | null;
+  resellerId: string | null;
+  quantity: number;
+  unitPriceMinor: number;
+  fulfillmentMode: "AUTOMATIC" | "MANUAL";
+  allowPwChange: boolean;
+  /** When set, EVERY buyer gets this same value. */
+  reusableSecret: string | null;
+  /** Remaining sellable quantity for a reusable product; null = unlimited. */
+  reusableStock: number | null;
+  /** Optional sellable quantity for a MANUAL product; null = unlimited. */
+  manualStock: number | null;
+  /**
+   * The variant's cost, carried through so delivery does NOT have to re-query it.
+   * costForVariant fired one query per unit INSIDE the checkout transaction, for
+   * a column priceCart already had in memory — pure round trips while holding
+   * inventory row locks.
+   */
+  defaultCostMinor: number | null;
+  /**
+   * How long what we deliver stays valid, in hours, or null for "no expiry of
+   * our own". Resolved once here from the variant's hour column (falling back
+   * to the legacy day column) so delivery never re-reads or re-interprets it.
+   */
+  validityHours: number | null;
+}
+
+/**
+ * When a delivered unit stops working.
+ *
+ * A stock item that carries its own expiry (a key the supplier dated) wins —
+ * that date is a fact about the key itself. Otherwise the variant's validity
+ * runs from the moment of delivery, which is what makes a "6-hour trial"
+ * possible at all. Null means we know of no expiry.
+ */
+export function deliveryExpiry(
+  stockExpiresAt: Date | null | undefined,
+  validityHours: number | null | undefined,
+  at: Date = new Date(),
+): Date | null {
+  if (stockExpiresAt) return stockExpiresAt;
+  if (!validityHours || validityHours <= 0) return null;
+  return new Date(at.getTime() + validityHours * 3_600_000);
+}
+
+/** Re-price the user's cart from live price rows (RETAIL tier). */
+export async function priceCart(tx: Tx, userId: string, currency: Currency, channel: "DIRECT" | "API" = "DIRECT", direct?: Array<{ variantId: string; quantity: number }>): Promise<PricedLine[]> {
+  const masterKey = loadConfig().ENCRYPTION_MASTER_KEY;
+  // `direct`: price an explicit basket (a one-tap Mini App purchase) without
+  // reading — or later clearing — the customer's cart.
+  const cart = direct
+    ? {
+        items: await Promise.all(direct.map(async (d) => {
+          const variant = await tx.productVariant.findUnique({ where: { id: d.variantId }, include: { product: true, prices: { where: { tier: { name: "RETAIL" } } } } });
+          if (!variant) throw new CoreError("VARIANT_NOT_FOUND");
+          return { variant, quantity: d.quantity };
+        })),
+      }
+    : await tx.cart.findUnique({
+    where: { userId },
+    include: {
+      items: {
+        include: {
+          variant: {
+            include: {
+              product: true,
+              // All RETAIL prices: prefer the requested currency, else convert.
+              prices: { where: { tier: { name: "RETAIL" } } },
+            },
+          },
+        },
+      },
+    },
+  });
+  if (!cart || cart.items.length === 0) throw new CoreError("CART_EMPTY");
+
+  // VIP per-user price overrides (by product) for this user, for this channel.
+  // A channel-specific price (DIRECT/API) wins over a BOTH price.
+  const overrides = await tx.userPrice.findMany({ where: { userId, channel: { in: [channel, "BOTH"] } } });
+  const overrideByProduct = new Map<string, number>();
+  for (const o of overrides) {
+    // Overrides carry their own currency — convert before charging.
+    const amount = o.currency === currency ? o.amountMinor : convertMinor(o.amountMinor, o.currency as Currency, currency);
+    const cur = overrideByProduct.get(o.productId);
+    if (cur === undefined || o.channel === channel) overrideByProduct.set(o.productId, amount);
+  }
+
+  return cart.items.map((item) => {
+    const v = item.variant;
+    if (!v.isActive || v.deletedAt !== null || v.product.status !== "ACTIVE" || v.product.deletedAt !== null) {
+      throw new CoreError("CART_ITEM_UNAVAILABLE", `${v.product.name} is no longer available`);
+    }
+    const exact = v.prices.find((p) => p.currency === currency);
+    const other = v.prices[0];
+    if (!exact && !other) throw new CoreError("PRICE_UNAVAILABLE", `${v.product.name} has no price`);
+    // No price list in this currency → convert the one we have at the configured rate.
+    const price = exact ?? { amountMinor: convertPriceMinor((other as NonNullable<typeof other>).amountMinor, (other as NonNullable<typeof other>).currency as Currency, currency) };
+    const vipOverride = overrideByProduct.get(v.productId);
+    return {
+      variantId: v.id,
+      productId: v.productId,
+      categoryId: v.product.categoryId,
+      productName: v.product.name,
+      variantName: v.name,
+      productType: v.product.type,
+      activationGuide: v.product.activationGuide,
+      allowPwChange: v.product.allowPasswordChange,
+      reusableSecret: v.product.reusableSecretEnc ? decryptSecret(v.product.reusableSecretEnc, masterKey) : null,
+      reusableStock: v.product.reusableStock,
+      manualStock: v.product.fulfillmentMode === "MANUAL" ? v.product.manualStock : null,
+      defaultCostMinor: v.defaultCostMinor ?? null,
+      validityHours: effectiveHours(v.durationHours, v.durationDays),
+      resellerId: v.product.resellerId,
+      quantity: item.quantity,
+      // Quantity is passed HERE, not only in the shop display. A bulk discount
+      // shown but not charged is a chargeback waiting to happen.
+      unitPriceMinor: vipOverride ?? effectivePriceMinor(price.amountMinor, v.product, new Date(), item.quantity),
+      fulfillmentMode: (v.fulfillmentMode ?? v.product.fulfillmentMode) as "AUTOMATIC" | "MANUAL",
+    };
+  });
+}
+
+/**
+ * The priced cart as a scoped coupon needs to see it: which product, which
+ * category, and what that line is worth. Every rail prices the cart the same
+ * way, so they all hand the coupon the same view of it.
+ */
+export function couponLines(lines: PricedLine[]): Array<{ productId: string; categoryId: string; lineTotalMinor: number }> {
+  return lines.map((l) => ({ productId: l.productId, categoryId: l.categoryId, lineTotalMinor: l.unitPriceMinor * l.quantity }));
+}
+
+/** The order item shape a reusable ("same link for everyone") delivery needs. */
+export interface ReusableItem {
+  id: string;
+  variant: {
+    defaultCostMinor: number | null;
+    durationHours: number | null;
+    durationDays: number | null;
+    product: { id: string; reusableSecretEnc: string | null; reusableStock: number | null };
+  };
+}
+
+/**
+ * Deliver a "♾ Same link for everyone" product: one stored value handed to
+ * every buyer, consuming no inventory.
+ *
+ * The wallet checkout knew how to do this; the UPI/Binance confirmation and the
+ * gateway webhook did NOT — they went straight to assignLicenseKey, found no
+ * stock rows (a reusable product has none by design) and parked the paid order
+ * in AWAITING_STOCK / PENDING_FULFILLMENT. The customer's link then only ever
+ * arrived if an admin hand-delivered it. This is that missing branch, shared by
+ * every rail so they cannot drift apart again.
+ *
+ * Returns the payload to deliver, or null when the product is not reusable.
+ * Throws OUT_OF_STOCK when a sellable quantity was set and is exhausted.
+ */
+export async function fulfillReusableItemTx(
+  tx: Tx,
+  item: ReusableItem,
+  masterKey: string,
+): Promise<{ kind: "LICENSE_KEY"; key: string; expiresAt?: string } | null> {
+  const product = item.variant.product;
+  if (!product.reusableSecretEnc) return null;
+  const secret = decryptSecret(product.reusableSecretEnc, masterKey);
+  // Respect a sellable quantity when the admin set one (null = unlimited).
+  if (product.reusableStock !== null && product.reusableStock !== undefined) {
+    const dec = await tx.product.updateMany({
+      where: { id: product.id, reusableStock: { gte: 1 } },
+      data: { reusableStock: { decrement: 1 } },
+    });
+    if (dec.count === 0) throw new CoreError("OUT_OF_STOCK", "This product is sold out");
+  }
+  // A shared value has no stock row, so its expiry can only come from the
+  // variant's validity — the wallet rail has always worked this out, but the
+  // gateway/UPI rails went through here and recorded no expiry at all, so a
+  // time-limited shared link never expired and never prompted a renewal.
+  const expiresAt = deliveryExpiry(null, effectiveHours(item.variant.durationHours, item.variant.durationDays));
+  const payload = { kind: "LICENSE_KEY" as const, key: secret, ...(expiresAt ? { expiresAt: expiresAt.toISOString() } : {}) };
+  await tx.orderItem.update({
+    where: { id: item.id },
+    data: {
+      fulfilledAt: new Date(),
+      warrantyStartAt: new Date(),
+      expiresAt,
+      costMinor: item.variant.defaultCostMinor,
+      deliveryPayloadEncrypted: encryptSecret(JSON.stringify(payload), masterKey),
+    },
+  });
+  return payload;
+}
+
+/**
+ * Assign one license key to an order item. When `preferReserved` is set
+ * (gateway fulfillment), RESERVED rows are consumed before AVAILABLE ones.
+ */
+export async function assignLicenseKey(
+  tx: Tx,
+  variantId: string,
+  orderItemId: string,
+  masterKey: string,
+  preferReserved = false,
+  excludeIds: string[] = [],
+): Promise<{ key: string; expiresAt: Date | null; costMinor: number | null }> {
+  const exclude = excludeIds.length > 0 ? excludeIds : ["-"];
+  const statuses = preferReserved ? ["RESERVED", "AVAILABLE"] : ["AVAILABLE"];
+  for (const status of statuses) {
+    const rows = await tx.$queryRaw<Array<{ id: string; keyEncrypted: string; expiresAt: Date | null; purchaseCostMinor: number | null }>>`
+      SELECT "id", "keyEncrypted", "expiresAt", "purchaseCostMinor" FROM "LicenseKey"
+      WHERE "variantId" = ${variantId} AND "status" = ${status}::"InventoryStatus" AND "deletedAt" IS NULL
+        AND NOT ("id" = ANY(${exclude}::text[]))
+      ORDER BY "createdAt" ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED`;
+    const row = rows[0];
+    if (!row) continue;
+    await tx.licenseKey.update({
+      where: { id: row.id },
+      data: { status: "SOLD", soldAt: new Date(), orderItemId, reservedUntil: null },
+    });
+    return {
+      key: decryptSecret(row.keyEncrypted, masterKey),
+      expiresAt: row.expiresAt,
+      costMinor: row.purchaseCostMinor ?? null,
+    };
+  }
+  throw new CoreError("OUT_OF_STOCK");
+}
+
+/** Assign one digital-account slot (shared accounts: maxSlots/usedSlots). */
+export async function assignAccountSlot(
+  tx: Tx,
+  variantId: string,
+  orderItemId: string,
+  masterKey: string,
+  preferReserved = false,
+  excludeIds: string[] = [],
+): Promise<{ username: string; password: string; twofa?: string; expiresAt: Date | null; costMinor: number | null }> {
+  const exclude = excludeIds.length > 0 ? excludeIds : ["-"];
+  const statuses = preferReserved ? ["RESERVED", "AVAILABLE"] : ["AVAILABLE"];
+  for (const status of statuses) {
+    const rows = await tx.$queryRaw<
+      Array<{
+        id: string;
+        usernameEncrypted: string;
+        passwordEncrypted: string;
+        twofaEncrypted: string | null;
+        expiresAt: Date | null;
+        maxSlots: number;
+        usedSlots: number;
+        purchaseCostMinor: number | null;
+      }>
+    >`
+      SELECT "id", "usernameEncrypted", "passwordEncrypted", "twofaEncrypted", "expiresAt", "maxSlots", "usedSlots", "purchaseCostMinor"
+      FROM "DigitalAccount"
+      WHERE "variantId" = ${variantId} AND "status" = ${status}::"InventoryStatus" AND "deletedAt" IS NULL
+        AND "usedSlots" < "maxSlots"
+        AND NOT ("id" = ANY(${exclude}::text[]))
+      ORDER BY "createdAt" ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED`;
+    const row = rows[0];
+    if (!row) continue;
+    const nowFull = row.usedSlots + 1 >= row.maxSlots;
+    await tx.digitalAccount.update({
+      where: { id: row.id },
+      data: {
+        usedSlots: { increment: 1 },
+        reservedUntil: null,
+        ...(nowFull ? { status: "SOLD" as const } : { status: "AVAILABLE" as const }),
+      },
+    });
+    await tx.accountAssignment.create({
+      data: { accountId: row.id, orderItemId, slotLabel: `Slot ${row.usedSlots + 1}` },
+    });
+    return {
+      username: decryptSecret(row.usernameEncrypted, masterKey),
+      password: decryptSecret(row.passwordEncrypted, masterKey),
+      ...(row.twofaEncrypted ? { twofa: decryptSecret(row.twofaEncrypted, masterKey) } : {}),
+      expiresAt: row.expiresAt,
+      costMinor: row.purchaseCostMinor ?? null,
+    };
+  }
+  throw new CoreError("OUT_OF_STOCK");
+}
+
+export interface DeliveryPayload {
+  kind: string;
+  key?: string;
+  username?: string;
+  password?: string;
+  twofa?: string;
+  expiresAt?: string;
+}
+
+/** HTML delivery message — same shape the bot renders (Bot UX doc §6). */
+/**
+ * Clean a pasted credential line. Pasted text often arrives auto-linked as
+ * markdown ("[a@b.com](mailto:a@b.com)|pw") or HTML; splitting that raw would
+ * break at the "mailto:" colon and duplicate the address.
+ */
+export function sanitizeCredentialLine(raw: string): string {
+  return raw
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1") // [text](url) → text
+    .replace(/<a[^>]*>(.*?)<\/a>/gi, "$1") // <a ...>text</a> → text
+    .replace(/\bmailto:/gi, "")
+    .replace(/[\u200b-\u200d\ufeff]/g, "") // zero-width junk
+    .trim();
+}
+
+/**
+ * Split one credential line into its parts. Separator priority — an explicit
+ * "|" always wins, so a value containing a colon can never be mis-split:
+ *   "user | pass"           → id + password
+ *   "user | pass | SECRET"  → id + password + 2FA secret (paste at 2fa.live)
+ *   "user:pass"             → id + password
+ * License keys are left alone: "-" is never a separator (XXXX-XXXX-XXXX), and
+ * ":" / whitespace only split when every resulting part is space-free.
+ */
+export function splitCredential(line: string): { id: string; pw: string; twofa?: string } | null {
+  const t = sanitizeCredentialLine(line);
+  if (!t) return null;
+
+  const build = (parts: string[]): { id: string; pw: string; twofa?: string } | null => {
+    const clean = parts.map((x) => x.trim()).filter((x, i) => x !== "" || i < 2);
+    const [id, pw] = clean;
+    if (!id || !pw) return null;
+    const extra = clean.length > 2 ? clean.slice(2).filter(Boolean).join("|") : undefined;
+    return { id, pw, ...(extra ? { twofa: extra } : {}) };
+  };
+
+  // "|" is the only separator allowed to contain spaces/colons — it is explicit,
+  // so the admin opted in. Everything else must look unambiguously like a
+  // credential pair: no spaces and no colons in any part. That keeps license
+  // keys ("XKEY-1122, valid till 2027"), prose ("Note: keep this safe") and
+  // URLs ("https://x/y") from ever being split into ID/Password.
+  if (t.includes("|")) return build(t.split("|"));
+  // For implicit separators the WHOLE line must be whitespace-free and not a
+  // URL, otherwise prose ("Time: 12:30") and links ("https://x/y") get split.
+  const tidy = (parts: string[]): { id: string; pw: string; twofa?: string } | null => {
+    if (/\s/.test(t) || t.includes("://")) return null;
+    return parts.length >= 2 && parts.length <= 3 && parts.every((x) => x !== "") ? build(parts) : null;
+  };
+  if (t.includes(",")) return tidy(t.split(","));
+  if (t.includes(":")) return tidy(t.split(":"));
+  return null;
+}
+
+/**
+ * Repair a username/password pair that was stored by the OLD buggy parser.
+ * That parser split at the earliest separator, so a pasted markdown email link
+ * broke apart inside "mailto:" — leaving the address in BOTH fields. Rejoining
+ * on ":" reconstructs the original line, which the fixed parser reads correctly.
+ * Defensive: stock already saved wrong still delivers correctly.
+ */
+export function repairAccountPair(
+  username: string | undefined,
+  password: string | undefined,
+): { id: string; pw: string; twofa?: string } | null {
+  if (!username || !password) return null;
+  const looksBroken = /\[|\]\(|mailto\s*$/i.test(username) || /\)\s*\|/.test(password);
+  if (!looksBroken) return null;
+  return splitCredential(`${username}:${password}`);
+}
+
+/** Clipboard values for the copy buttons — repaired and matching what is displayed. */
+export function credsOf(payload: DeliveryPayload): { id?: string; pw?: string; twofa?: string; key?: string } {
+  const fixed = repairAccountPair(payload.username, payload.password);
+  const id = fixed?.id ?? payload.username;
+  const pw = fixed?.pw ?? payload.password;
+  const twofa = fixed?.twofa ?? payload.twofa;
+  if (id && pw) return { id, pw, twofa };
+  // A single-line key blob may itself be "id|pass[|2fa]".
+  if (payload.key) {
+    const rows = payload.key.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+    if (rows.length === 1) {
+      const c = splitCredential(rows[0] ?? "");
+      if (c) return { id: c.id, pw: c.pw, twofa: c.twofa };
+      return { key: rows[0] };
+    }
+  }
+  return {};
+}
+
+/** The one string a customer copies for a delivered unit: the key / link, or "id|password[|2fa]". */
+export function deliveredValue(payload: DeliveryPayload): string {
+  const c = credsOf(payload);
+  if (c.id && c.pw) return `${c.id}|${c.pw}${c.twofa ? `|${c.twofa}` : ""}`;
+  if (c.key) return c.key;
+  return (payload.key ?? payload.username ?? "").trim();
+}
+
+/** At most this many per-item copy buttons on one delivery (plus Copy ALL). */
+const COPY_BUTTON_CAP = 12;
+
+/**
+ * One copy button per delivered unit, plus Copy ALL, then the usual
+ * navigation. A value short enough rides in a native copy_text button; a long
+ * one (a 300-character activation link) cannot — Telegram caps copy_text at
+ * 256 — so it gets a callback button instead, which the bot answers with the
+ * value alone in a tap-to-copy code block (`dl:copy:<orderId>:<n>`).
+ */
+export function combinedDeliveryButtons(items: DeliveryLine[], orderId: string): OutboxButton[] {
+  const values = items.map((it) => deliveredValue(it.payload)).filter((v) => v.length > 0);
+  const out: OutboxButton[] = [];
+  values.slice(0, COPY_BUTTON_CAP).forEach((v, i) => {
+    const n = i + 1;
+    const text = values.length === 1 ? "📋 Copy" : `📋 Copy #${n}`;
+    out.push(isCopyable(v) ? { text, copyText: v } : { text, callbackData: `dl:copy:${orderId}:${n}` });
+  });
+  if (values.length > 1) {
+    const all = values.join("\n");
+    out.push(isCopyable(all) ? { text: "📋 Copy ALL", copyText: all } : { text: "📋 Copy ALL", callbackData: `dl:copyall:${orderId}` });
+  }
+  // Copy buttons only — navigation goes in DELIVERY_FOLLOWUP, a separate message.
+  return out;
+}
+
+/** The 2FA helper site customers paste the secret into. */
+export const TWOFA_SITE = "https://2fa.live";
+
+/** A delivered value that is just a link (redemption/sign-in URL), not a key. */
+export function isDeliveredLink(value: string | undefined | null): value is string {
+  if (!value) return false;
+  const t = value.trim();
+  return /^https?:\/\/\S+$/i.test(t) && !/\s/.test(t);
+}
+
+/**
+ * Render a delivered link: the URL itself, once, on its own line.
+ *
+ * It used to be an anchor labelled "Tap here to open your link" with the raw
+ * URL repeated underneath in <code>. Two lines for one value, the words in
+ * front of every link, and a 380-character sign-in URL printed twice — the
+ * operator asked for the link, directly. Telegram auto-links a bare URL, so it
+ * is still one tap to open and a long-press to copy.
+ */
+export function linkLines(url: string, indent = ""): string[] {
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return [`${indent}${esc(url.trim())}`];
+}
+
+
+export function buildDeliveryText(
+  productName: string,
+  variantName: string,
+  payload: DeliveryPayload,
+  activationGuide?: string | null,
+  allowPwChange?: boolean,
+  opts: DeliveryRenderOpts = {},
+): string {
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const vn = variantName.trim().toLowerCase() === "standard" ? "" : ` · ${esc(variantName)}`;
+  // Same shape as the multi-item delivery: header facts, then the value itself.
+  const lines = ["✅ <b>Order Delivered!</b>", "", `📦 <b>${esc(productName)}</b>${vn} (x1)`];
+  if (opts.amountLabel) lines.push(`💲 ${esc(opts.amountLabel)}`);
+  if (opts.orderNumber) lines.push(`🧾 #${esc(opts.orderNumber)}`);
+  lines.push("", "⚡ <b>Your Product:</b>");
+
+  let renderedCreds = false;
+  if (payload.key) {
+    // One delivered blob may hold several lines (multi-quantity or an account list).
+    const rows = payload.key.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+    const creds = rows.map(splitCredential);
+    const allCreds = rows.length > 0 && creds.every((c) => c !== null);
+    if (allCreds) {
+      renderedCreds = true;
+      rows.forEach((_, i) => {
+        const c = creds[i] as { id: string; pw: string; twofa?: string };
+        if (rows.length > 1) lines.push(`<b>${i + 1}.</b>`);
+        lines.push(`👤 <b>ID:</b>  <code>${esc(c.id)}</code>`);
+        lines.push(`🔐 <b>Password:</b>  <code>${esc(c.pw)}</code>`);
+        if (c.twofa) lines.push(`🔢 <b>2FA secret:</b>  <code>${esc(c.twofa)}</code>`);
+        if (rows.length > 1 && i < rows.length - 1) lines.push("");
+      });
+    } else if (rows.length > 1) {
+      // Numbered, value directly under the number — no label words in front.
+      rows.forEach((r, i) => lines.push(`<b>${i + 1}.</b>`, ...(isDeliveredLink(r) ? linkLines(r) : [`<code>${esc(r)}</code>`])));
+    } else if (isDeliveredLink(rows[0] ?? payload.key)) {
+      lines.push("<b>1.</b>", ...linkLines((rows[0] ?? payload.key) as string));
+    } else {
+      lines.push("<b>1.</b>", `<code>${esc(payload.key)}</code>`);
+    }
+  }
+  const fixed = repairAccountPair(payload.username, payload.password);
+  const uName = fixed?.id ?? payload.username;
+  const uPass = fixed?.pw ?? payload.password;
+  const uTwofa = fixed?.twofa ?? payload.twofa;
+  if (uName) lines.push(`👤 <b>ID:</b>  <code>${esc(uName)}</code>`);
+  if (uPass) lines.push(`🔐 <b>Password:</b>  <code>${esc(uPass)}</code>`);
+  if (uTwofa) lines.push(`🔢 <b>2FA secret:</b>  <code>${esc(uTwofa)}</code>`);
+  if (uTwofa) {
+    lines.push(
+      "",
+      "🔐 <b>How to get your OTP</b>",
+      `1. Open <a href="${TWOFA_SITE}">2fa.live</a>`,
+      "2. Paste the <b>2FA secret</b> above into the box",
+      "3. Tap <b>Submit</b> — it shows a 6-digit code",
+      "4. Enter that code when logging in (it refreshes every 30s)",
+      "",
+      "📋 <b>Copy all credentials:</b>",
+      `<code>${esc(uName ?? "")}|${esc(uPass ?? "")}|${esc(uTwofa)}</code>`,
+    );
+  } else if (uName && uPass) {
+    lines.push("", "📋 <b>Copy all credentials:</b>", `<code>${esc(uName)}|${esc(uPass)}</code>`);
+  }
+  if (renderedCreds && payload.key) {
+    const rows = payload.key.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+    const anyTwofa = rows.map(splitCredential).some((c) => c?.twofa);
+    if (anyTwofa) {
+      lines.push(
+        "",
+        `🔐 <b>How to get your OTP</b>`,
+        `1. Open <a href="${TWOFA_SITE}">2fa.live</a>`,
+        `2. Paste the <b>2FA secret</b> above into the box`,
+        `3. Tap <b>Submit</b> — it shows a 6-digit code`,
+        `4. Enter that code when logging in (it refreshes every 30s)`,
+      );
+    }
+    lines.push("", "📋 <b>Copy all credentials:</b>");
+    for (const r of rows) lines.push(`<code>${esc(r)}</code>`);
+  }
+  if (uName || renderedCreds) {
+    lines.push("", "ℹ️ Tap any value above to copy it.");
+    lines.push(allowPwChange ? "🔓 This account is yours — you're welcome to change the password." : "🔒 Please do <b>not</b> change the account password.");
+  }
+  if (payload.expiresAt) lines.push(`⏳ Valid until: ${payload.expiresAt.slice(0, 10)}`);
+  if (activationGuide) lines.push("", `📄 ${esc(activationGuide)}`);
+  lines.push("", "💾 <b>Saved in 📦 My Orders</b> — reopen it any time from 📦 View my orders.", "Enjoy! 🚀", "Problem? Open a 🎫 Support ticket.");
+  return lines.join("\n");
+}
+
+/** Friendly display name for greetings: @handle, else first name, else "there". */
+export function greetName(u: { telegramHandle?: string | null; firstName?: string | null }): string {
+  const f = (u.firstName ?? "").trim();
+  if (f) return f.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  if (u.telegramHandle) return `@${u.telegramHandle}`;
+  return "there";
+}
+
+/** Warm, respectful, personalised thank-you sent after a successful purchase. */
+export function thankYouMessage(u: { telegramHandle?: string | null; firstName?: string | null }, storeName: string): string {
+  return [
+    `🎁 <b>Thank you so much, ${greetName(u)}!</b> 🙏`,
+    `It's truly an honour to serve you. We deeply appreciate your trust in ${storeName}.`,
+    `Wishing you the very best — enjoy your purchase! 💙`,
+  ].join("\n");
+}
+
+/**
+ * Sent when a customer walks away from a checkout.
+ *
+ * A bare "Payment cancelled." reads as a door closing. This is the one moment
+ * the customer is still here, still interested enough to have got as far as
+ * paying — so it says the cart is safe, that nothing was charged, and leaves
+ * the way back open. Warm, short, and not pleading.
+ */
+export function comeBackMessage(u: { telegramHandle?: string | null; firstName?: string | null }): string {
+  return [
+    `😢 <b>Oh no — you're leaving already, ${greetName(u)}?</b>`,
+    "",
+    "No worries at all, and <b>nothing has been charged</b>. 💙",
+    "",
+    "🛒 Your items are still waiting in your cart, exactly as you left them.",
+    "⚡ Stock moves fast though — the good ones rarely wait around.",
+    "",
+    "Come back whenever you're ready. We'd love to serve you. 🙏",
+  ].join("\n");
+}
+
+/** Orders with more than this many delivered items get a .txt file instead of one long chat message. */
+export const DELIVERY_FILE_THRESHOLD = 15;
+
+export interface DeliveryLine {
+  productName: string;
+  variantName: string;
+  payload: DeliveryPayload;
+  activationGuide?: string | null;
+  allowPwChange?: boolean;
+}
+
+/** Extras the delivery renderers accept. All optional — old callers are unchanged. */
+export interface DeliveryRenderOpts {
+  /** Pre-formatted order total, e.g. "₹499.00". Shown so the customer can see what they paid. */
+  amountLabel?: string;
+  /** Shown as "#DEAL-…" in the single-item header (the multi-item builder takes it as a parameter). */
+  orderNumber?: string;
+  /**
+   * Number the items (`1)`, `2)` …). On by default; the .txt download offers a
+   * version with this off, because a customer feeding the file to a script or
+   * pasting it elsewhere wants the values and nothing else.
+   */
+  numbered?: boolean;
+}
+
+/**
+ * One consolidated HTML message for a whole multi-item order (used when count ≤ threshold).
+ *
+ * Shaped after what customers are used to from other shops: a short header
+ * (product, amount, order number), then "Your Products:" with every value
+ * numbered and shown DIRECTLY — a link is the link, a key is the key. The
+ * product name is said once per product, not once per unit: ten codes for the
+ * same item used to print the item's name ten times, which buried the codes.
+ */
+export function buildCombinedDeliveryText(items: DeliveryLine[], orderNumber?: string, opts: DeliveryRenderOpts = {}): string {
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const out: string[] = ["✅ <b>Order Delivered!</b>", ""];
+
+  // Group consecutive units of the same product/variant so the name appears once.
+  const groups: Array<{ productName: string; variantName: string; items: DeliveryLine[] }> = [];
+  for (const it of items) {
+    const last = groups[groups.length - 1];
+    if (last && last.productName === it.productName && last.variantName === it.variantName) last.items.push(it);
+    else groups.push({ productName: it.productName, variantName: it.variantName, items: [it] });
+  }
+  const label = (g: { productName: string; variantName: string; items: DeliveryLine[] }): string => {
+    const vn = g.variantName.trim().toLowerCase() === "standard" ? "" : ` · ${esc(g.variantName)}`;
+    return `📦 <b>${esc(g.productName)}</b>${vn} (x${g.items.length})`;
+  };
+  // One product: named here, once. Several: counted here, named at each section
+  // below — never both, so no name is printed twice.
+  if (groups.length === 1) out.push(label(groups[0]!));
+  else out.push(`📦 <b>${groups.length} products</b> · ${items.length} items`);
+  if (opts.amountLabel) out.push(`💲 ${esc(opts.amountLabel)}`);
+  if (orderNumber) out.push(`🧾 #${esc(orderNumber)}`);
+  out.push("", "⚡ <b>Your Products:</b>");
+
+  // Anything identical for every unit is said ONCE, at the bottom.
+  const copyAll: string[] = [];
+  let anyTwofa = false;
+  const policies = new Set<boolean>();
+  const mixedPolicy = (): boolean => policies.size > 1;
+  const deliversLogin = (it: DeliveryLine): boolean => {
+    const p = it.payload;
+    if (p.password) return true;
+    if (!p.key) return false;
+    const rows = p.key.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+    return rows.length > 0 && rows.map(splitCredential).every((c) => c !== null);
+  };
+  items.forEach((it) => { if (deliversLogin(it)) policies.add(it.allowPwChange === true); });
+
+  let n = 0;
+  for (const g of groups) {
+    // The heading only when there is more than one product — with a single
+    // product it is already in the header above, and repeating it is exactly
+    // the noise this layout removes.
+    if (groups.length > 1) out.push("", label(g));
+    for (const it of g.items) {
+      const p = it.payload;
+      const value: string[] = [];
+      if (p.key) {
+        const rows = p.key.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+        const creds = rows.map(splitCredential);
+        if (rows.length > 0 && creds.every((c) => c !== null)) {
+          rows.forEach((_, k) => {
+            const c = creds[k] as { id: string; pw: string; twofa?: string };
+            if (rows.length > 1 && k > 0) value.push("");
+            value.push(`👤 ID: <code>${esc(c.id)}</code>`);
+            value.push(`🔐 Password: <code>${esc(c.pw)}</code>`);
+            if (c.twofa) { anyTwofa = true; value.push(`🔢 2FA secret: <code>${esc(c.twofa)}</code>`); }
+            copyAll.push(`${c.id}|${c.pw}${c.twofa ? `|${c.twofa}` : ""}`);
+          });
+        } else {
+          for (const r of rows) value.push(...(isDeliveredLink(r) ? linkLines(r) : [`<code>${esc(r)}</code>`]));
+        }
+      }
+      const fx = repairAccountPair(p.username, p.password);
+      const cName = fx?.id ?? p.username;
+      const cPass = fx?.pw ?? p.password;
+      const cTwo = fx?.twofa ?? p.twofa;
+      if (cName) value.push(`👤 ID: <code>${esc(cName)}</code>`);
+      if (cPass) value.push(`🔐 Password: <code>${esc(cPass)}</code>`);
+      if (cTwo) { anyTwofa = true; value.push(`🔢 2FA secret: <code>${esc(cTwo)}</code>`); }
+      if (cName && cPass) copyAll.push(`${cName}|${cPass}${cTwo ? `|${cTwo}` : ""}`);
+      if (deliversLogin(it) && mixedPolicy()) value.push(it.allowPwChange ? "🔓 Password can be changed" : "🔒 Do not change the password");
+      if (p.expiresAt) value.push(`⏳ Valid until ${p.expiresAt.slice(0, 10)}`);
+      n += 1;
+      out.push(`<b>${n}.</b>`, ...value);
+    }
+  }
+
+  const blank = (): void => { if (out[out.length - 1] !== "") out.push(""); };
+  if (anyTwofa) { blank(); out.push(`🔢 <b>2FA:</b> paste a 2FA secret at <a href="${TWOFA_SITE}">2fa.live</a> to get its 6-digit code.`); }
+  if (!mixedPolicy() && policies.size === 1) {
+    blank();
+    const many = items.filter(deliversLogin).length > 1;
+    out.push([...policies][0] === true
+      ? `🔓 ${many ? "These accounts are" : "This account is"} yours — you're welcome to change the password${many ? "s" : ""}.`
+      : `🔒 Please do <b>not</b> change the account password${many ? "s" : ""}.`);
+  }
+  if (copyAll.length > 0) {
+    blank();
+    out.push("📋 <b>Copy all credentials:</b>", ...copyAll.map((l) => `<code>${esc(l)}</code>`));
+  }
+  blank();
+  out.push("💾 Saved in 📦 My Orders — reopen any time.", "Problem? Open a 🎫 Support ticket.");
+  return out.join("\n");
+}
+
+/** Plaintext body for the .txt attachment sent for large orders (> threshold). */
+export function buildDeliveryTxt(items: DeliveryLine[], orderNumber?: string, opts: DeliveryRenderOpts = {}): string {
+  const numbered = opts.numbered !== false;
+  const out: string[] = [];
+  out.push(`ORDER DELIVERY${orderNumber ? ` — ${orderNumber}` : ""}`);
+  out.push(`${items.length} item(s)`);
+  if (opts.amountLabel) out.push(`Amount paid: ${opts.amountLabel}`);
+  out.push("=".repeat(40), "");
+  items.forEach((it, i) => {
+    const vn = it.variantName.trim().toLowerCase() === "standard" ? "" : ` · ${it.variantName}`;
+    out.push(`${numbered ? `${i + 1}) ` : ""}${it.productName}${vn}`);
+    const p = it.payload;
+    if (p.key) {
+      const rows = p.key.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+      const creds = rows.map(splitCredential);
+      if (rows.length > 0 && creds.every((c) => c !== null)) {
+        rows.forEach((_, k) => {
+          const c = creds[k] as { id: string; pw: string; twofa?: string };
+          const rowTag = rows.length > 1 && numbered ? `${k + 1}) ` : "";
+          const rowPad = rows.length > 1 && numbered ? "   " : "";
+          out.push(`   ${rowTag}ID: ${c.id}`);
+          out.push(`   ${rowPad}Password: ${c.pw}`);
+          if (c.twofa) out.push(`   ${rowPad}2FA secret: ${c.twofa}   (paste at ${TWOFA_SITE} to get the OTP)`);
+        });
+      } else {
+        for (const r of rows) out.push(`   Key: ${r}`);
+      }
+    }
+    const fxx = repairAccountPair(p.username, p.password);
+    const tName = fxx?.id ?? p.username;
+    const tPass = fxx?.pw ?? p.password;
+    const tTwo = fxx?.twofa ?? p.twofa;
+    if (tName) out.push(`   ID: ${tName}`);
+    if (tPass) out.push(`   Password: ${tPass}`);
+    if (tTwo) out.push(`   2FA secret: ${tTwo}   (paste at ${TWOFA_SITE} to get the OTP)`);
+    if (tName && tPass) out.push(`   Copy all: ${tName}|${tPass}${tTwo ? `|${tTwo}` : ""}`);
+    if (p.expiresAt) out.push(`   Valid until: ${p.expiresAt.slice(0, 10)}`);
+    if (it.activationGuide) out.push(`   Note: ${it.activationGuide}`);
+    out.push("");
+  });
+  out.push("Saved in My Orders in the bot - reopen any time. Problem? Open a Support ticket.");
+  return out.join("\n");
+}

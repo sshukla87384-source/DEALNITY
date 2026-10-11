@@ -1,0 +1,3487 @@
+import { isDev, loadConfig } from "@gis/config";
+import {
+  premiumEmojiTransformer,
+  noteFreeTopupIntent,
+  addToCart,
+  adjustWallet,
+  releaseMaturedReferralRewards,
+  referralEarnings,
+  changeQty,
+  checkoutWithWallet,
+  checkoutWithBnpl,
+  repayBnpl,
+  greetName,
+  comeBackMessage,
+  applyCouponToCart,
+  removeCouponFromCart,
+  couponReason,
+  referralNudgeMessage,
+  shouldSendReferralNudge,
+  deliveryInstructionsMessage,
+  clearCart,
+  createGatewayCheckout,
+  createBinanceManualCheckout,
+  verifyBinanceByTxnId,
+  createCryptoCheckout,
+  createCryptoTopup,
+  binanceOffered,
+  upiOffered,
+  checkCryptoPayment,
+  cancelCryptoOrder,
+  cryptoNetwork,
+  type CryptoCard,
+  type CryptoNetwork,
+  creditFreeTopup,
+  buildCombinedDeliveryText,
+  buildDeliveryTxt,
+  isDeliveredLink,
+  linkLines,
+  isCopyable,
+  DELIVERY_FILE_THRESHOLD,
+  createApiKey,
+  revokeApiKeyOwned,
+  regenerateApiKeyForOwner,
+  getActiveApiKeyForOwner,
+  setResellerPrice,
+  createTicket,
+  getWallet,
+  convertMinor,
+  getCartView,
+  getCartCoupon,
+  tierOf,
+  getSpinConfig,
+  watchProduct,
+  listWatches,
+  reorderLines,
+  searchMyKeys,
+  unwatchProduct,
+  getProductView,
+  spin,
+  spinForOrder,
+  claimChallenge,
+  getBnplStatus,
+  addStock,
+  saveReview,
+  generateTotp,
+  looksLikeTotpSecret,
+  orderAlreadyRated,
+  addReviewComment,
+  logError,
+  grantAllScopesToOwner,
+  getInrPerUsdt,
+  createReplacementBatch,
+  createReplacementTicket,
+  listUnitsForOrder,
+  customerReplyTicket,
+  getReplaceableItem,
+  getProductIdBySlug,
+  getRedis,
+  hasUpiUtrBeenUsed,
+  shouldAutoDeliverUpi,
+  confirmManualPayment,
+  claimUpiUtrForOrder,
+  markUpiUtrPending,
+  stashUpiTopupClaim,
+  enqueueAdminAlert,
+  capTelegramHtml,
+  entitiesToTelegramHtml,
+  getAdminOrder,
+  stripTelegramHtml,
+  removeItem,
+  resolveTelegramUser,
+  revealDelivery,
+  splitCredential,
+  repairAccountPair,
+  revealOrderDeliveries,
+  deliveredValue,
+  enqueueTelegramMessage,
+  startRenewal,
+  createWalletGift,
+  claimGift,
+  listMyGifts,
+  firstOrderAllowed,
+  syncComboDiscount,
+  matchFaq,
+  getOrderTracking,
+  getOrderSummary,
+  setUserCurrency,
+  setUserLocale,
+  createUpiManualCheckout,
+  createStarsCheckout,
+  validateStarsPreCheckout,
+  creditFailedStarsPayment,
+  confirmStarsPayment,
+  getVariantAvailable,
+  rememberPaymentPrompt,
+  rememberChatClutter,
+  clearChatClutter,
+  clearPaymentPrompts,
+  registerPostTarget,
+  removePostTargetByChat,
+  resolveUserByTelegramId,
+  setVip,
+  setUserPrice,
+  removeUserPrice,
+  listUserPrices,
+  setStoreDefaultPrice,
+  type DeliveredSecret,
+  getMaintenance,
+} from "@gis/core";
+import type { Currency } from "@gis/database";
+import {
+  PRODUCT_DEEPLINK_PREFIX,
+  cb,
+  decryptSecret,
+  encryptSecret,
+  intArg,
+  isCoreError,
+  parseCb,
+} from "@gis/shared";
+import { Bot, GrammyError, InlineKeyboard, InputFile, session } from "grammy";
+import QRCode from "qrcode";
+import type { Ctx } from "./ctx.js";
+import { redisSessionStorage } from "./session.js";
+import { flowEnd, flowRemember, flowSetCard, flowStart, flowStep } from "./flow.js";
+import { adminCommand, askReAddBlocked, handleAdminCallback, handleAdminDocument, handleAdminText, isBotAdmin, notifyAdminsForApproval, setProductImageFromFileId } from "./admin.js";
+import { ERROR_COPY, escapeHtml, fmt } from "./ui.js";
+import { sbtn } from "./keyboard.js";
+import { LOCALES, t } from "./i18n.js";
+import { withPurchaseAnimation, successCard, num } from "./premium.js";
+import { e as pe, networkEmoji } from "./emoji.js";
+import * as views from "./views.js";
+import type { View } from "./views.js";
+
+/** Decrypt the session-held TOTP secret. Never stored or logged in the clear. */
+function otpSecretOf(ctx: Ctx): string | null {
+  const enc = ctx.session.otpSecret;
+  if (!enc) return null;
+  try {
+    return decryptSecret(enc, loadConfig().ENCRYPTION_MASTER_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/** Per-user serialization chain — see the middleware in createBot. */
+const userLocks = new Map<string, Promise<void>>();
+
+const SPAM_WINDOW_SEC = 10;
+const SPAM_MAX_ACTIONS = 20;
+
+/**
+ * Both endings of the 2-step claim form (photo sent, or "submit without one").
+ * In warranty → a replacement claim. Out of warranty → a support ticket, where
+ * a human decides; the bot never promises a replacement it cannot authorise.
+ */
+async function submitReplaceOrTicket(ctx: Ctx, proofFileId: string | undefined): Promise<void> {
+  ctx.session.awaiting = null;
+  const orderItemId = ctx.session.replaceItemId ?? "";
+  const reason = ctx.session.replaceReason ?? "(no reason given)";
+  const viaTicket = ctx.session.replaceViaTicket === true;
+  const batch = ctx.session.replaceBatch ?? [];
+  ctx.session.replaceItemId = undefined;
+  ctx.session.replaceReason = undefined;
+  ctx.session.replaceViaTicket = undefined;
+  ctx.session.replaceBatch = undefined;
+  ctx.session.replaceSelected = [];
+
+  // Multi-unit selection: each id is re-validated server-side, and the customer is
+  // told exactly which units were accepted and which were not.
+  if (batch.length > 0) {
+    const r = await createReplacementBatch({ userId: ctx.user.id, orderItemIds: batch, reason, proofFileId });
+    if (!r.ok) {
+      await ctx.reply(`⚠️ ${r.reason ?? "None of the selected items can be replaced."}`, {
+        reply_markup: new InlineKeyboard().text("🔄 Try again", cb("rep", "home")).text("🏠 Menu", "mnu:home"),
+      });
+      return;
+    }
+    const lines = [
+      "✅ <b>Request submitted</b>",
+      "",
+      `📦 <b>${r.accepted.length} item(s)</b> sent to our team:`,
+      ...r.accepted.map((a) => `• ${escapeHtml(a.label)} — unit ${a.unitNumber}${a.tail ? ` (…${escapeHtml(a.tail)})` : ""}`),
+    ];
+    if (r.claimIds.length > 0) {
+      lines.push("", `🛡 ${r.claimIds.length} covered by warranty — being reviewed now, your replacement arrives here once approved.`);
+    }
+    if (r.ticketNumber) {
+      lines.push("", `🎫 Out-of-warranty items opened ticket <b>${escapeHtml(r.ticketNumber)}</b> — a person will reply right here.`);
+    }
+    if (r.rejected.length > 0) {
+      lines.push("", "⚠️ <b>Not included:</b>", ...r.rejected.map((x) => `• ${escapeHtml(x.label)}${x.unitNumber ? ` unit ${x.unitNumber}` : ""} — ${escapeHtml(x.reason)}`));
+    }
+    lines.push("", "🙏 Thank you for your patience.");
+    await ctx.reply(lines.join("\n"), {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🎫 My tickets", "sup:home"),
+    });
+    return;
+  }
+
+  if (viaTicket) {
+    const r = await createReplacementTicket({ userId: ctx.user.id, orderItemId, reason, proofFileId });
+    await ctx.reply(
+      r.ok
+        ? [
+            `🎫 <b>Ticket ${r.ticketNumber} raised</b>`,
+            "",
+            "Our support team has your message and will reply right here.",
+            "",
+            "<i>This item is outside its warranty, so we can't promise a replacement — but a real person will look at it and do what they can. 🙏</i>",
+          ].join("\n")
+        : `⚠️ ${r.reason}`,
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🎫 My tickets", "sup:home").text("🏠 Menu", "mnu:home") },
+    );
+    return;
+  }
+
+  // A single unit is just a batch of one — same validation, same code path, so the
+  // two can never drift apart.
+  const r = await createReplacementBatch({ userId: ctx.user.id, orderItemIds: [orderItemId], reason, proofFileId });
+  if (!r.ok) {
+    await ctx.reply(`⚠️ ${r.reason ?? r.rejected[0]?.reason ?? "Not eligible for replacement."}`);
+    return;
+  }
+  await ctx.reply(
+    r.ticketNumber
+      ? [
+          `🎫 <b>Ticket ${escapeHtml(r.ticketNumber)} raised</b>`,
+          "",
+          "Our support team has your message and will reply right here.",
+          "",
+          "<i>This item is outside its warranty, so we can't promise a replacement — but a real person will look at it and do what they can. 🙏</i>",
+        ].join("\n")
+      : `✅ <b>Replacement request submitted!</b>\n\nOur team is reviewing it${proofFileId ? " and your screenshot" : ""} now — your replacement arrives here as soon as it is approved. Thank you for your patience. 🙏`,
+    { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🎫 My tickets", "sup:home") },
+  );
+}
+
+export function createBot(): Bot<Ctx> {
+  const config = loadConfig();
+  const bot = new Bot<Ctx>(config.BOT_TOKEN);
+  // Premium emoji on every page without touching each screen: plain emoji the
+  // shop owns a premium version of are swapped on the way out (and leading
+  // button emoji become button icons). Falls back to the original on a 400.
+  bot.api.config.use(premiumEmojiTransformer({ buttons: config.BUTTON_STYLES_ENABLED }) as never);
+
+  // Serialize updates per user. Webhook mode handles POSTs concurrently and
+  // Telegram redelivers on timeout, so without this a double-tap ran the same
+  // handler twice against the SAME session snapshot — producing duplicate
+  // replacement requests that could never be approved. A per-user promise chain
+  // is enough here and avoids pulling in @grammyjs/runner.
+  // ── Drop redelivered updates ──
+  // Telegram redelivers an update if the webhook does not answer in time. The
+  // per-user serializer below made the retry WAIT rather than dropping it, and
+  // the session was loaded before that wait — so the retry resumed from a stale
+  // snapshot and re-ran the handler with state the first pass had consumed.
+  // That is how one gift became a gift every minute: each retry still saw
+  // giftUser/giftTitle set and created the record again.
+  bot.use(async (ctx, next) => {
+    const id = ctx.update?.update_id;
+    if (typeof id !== "number") return next();
+    try {
+      // NX: the first caller wins, every redelivery is dropped. A whole hour is
+      // far longer than Telegram's retry window.
+      const first = await getRedis().set(`upd:${id}`, "1", "EX", 3600, "NX");
+      if (first !== "OK") return;
+    } catch {
+      // Redis down: fall through and process. Losing dedupe is better than
+      // losing the bot.
+    }
+    return next();
+  });
+
+  bot.use(async (ctx, next) => {
+    const uid = ctx.from?.id;
+    if (uid === undefined) return next();
+    const key = String(uid);
+    const prev = userLocks.get(key) ?? Promise.resolve();
+    let release: () => void = () => undefined;
+    const mine = new Promise<void>((res) => { release = res; });
+    // Keep a reference to the exact chained promise we stored, so the cleanup
+    // below can tell whether anyone queued behind us.
+    const chained = prev.then(() => mine);
+    userLocks.set(key, chained);
+    await prev.catch(() => undefined);
+    try {
+      await next();
+    } finally {
+      release();
+      // Only the last waiter clears the entry, so the map cannot grow unbounded.
+      if (userLocks.get(key) === chained) userLocks.delete(key);
+    }
+  });
+
+  // Session is loaded AFTER the serializer on purpose. Loading it before meant
+  // every update queued behind another had already taken its snapshot, so it
+  // resumed with state the earlier update had since consumed and saved.
+  bot.use(session({ initial: (): Ctx["session"] => ({}), storage: redisSessionStorage() }));
+
+  // ── Anti-spam: per-user token bucket (Bot UX doc §14) ──
+  bot.use(async (ctx, next) => {
+    const uid = ctx.from?.id;
+    if (!uid) {
+      // A channel post carries no `from`, so there is nothing to rate-limit on
+      // and everything below would key the bucket on "undefined". Dropping the
+      // update outright also killed /registergroup from a channel, which the
+      // help text promises. Let exactly those two commands through — and
+      // nothing else, so the rest of the bot still requires a real user.
+      const chanText = ctx.channelPost?.text ?? "";
+      if (/^\/(?:un)?registergroup(?:@\S+)?(?:\s|$)/i.test(chanText)) return next();
+      return;
+    }
+    // A completed payment is never rate-limited away — the money is already taken.
+    if (ctx.message?.successful_payment || ctx.preCheckoutQuery) return next();
+    const redis = getRedis();
+    const key = `bot:flood:${uid}`;
+    const count = await redis.incr(key);
+    if (count === 1) await redis.expire(key, SPAM_WINDOW_SEC);
+    if (count > SPAM_MAX_ACTIONS) {
+      if (count === SPAM_MAX_ACTIONS + 1 && ctx.chat) {
+        await ctx.reply("🐢 Slow down a little — try again in a few seconds.");
+      }
+      return;
+    }
+    await next();
+  });
+
+  // ── Telegram Stars: pre-checkout must be answered within 10s (no chat on this update) ──
+  bot.on("pre_checkout_query", async (ctx) => {
+    const q = ctx.preCheckoutQuery;
+    try {
+      const v = await validateStarsPreCheckout(q.invoice_payload, q.from.id, q.total_amount, q.currency);
+      await (v.ok ? ctx.answerPreCheckoutQuery(true) : ctx.answerPreCheckoutQuery(false, v.message));
+    } catch {
+      // A DB hiccup must not block a real payment — successful_payment has a safety net.
+      await ctx.answerPreCheckoutQuery(true).catch(() => undefined);
+    }
+  });
+
+  // ── Group registration commands (work in groups/channels; admin-gated) ──
+  // A channel post has no `from`, and an anonymous group admin posts as the
+  // group — so "is this a logged-in bot admin?" used to be false and channel
+  // registration could never succeed. Fall back to the chat's own admin list.
+  const chatRunByBotAdmin = async (ctx: Ctx): Promise<boolean> => {
+    if (ctx.from && ctx.from.id !== 1087968824) return isBotAdmin(ctx.from.id);
+    // Only a channel post (no sender) or an anonymous group admin falls back
+    // to the chat's admin list — never an ordinary group member.
+    if (!ctx.chat || ctx.chat.type === "private") return false;
+    const admins = await ctx.api.getChatAdministrators(ctx.chat.id).catch(() => []);
+    for (const a of admins) if (!a.user.is_bot && (await isBotAdmin(a.user.id))) return true;
+    return false;
+  };
+  bot.command("registergroup", async (ctx) => {
+    if (!(await chatRunByBotAdmin(ctx))) {
+      await ctx.reply("Only a logged-in admin can register a group. DM me and use /admin first (in a channel, the logged-in admin must also be an admin of this channel).").catch(() => undefined);
+      return;
+    }
+    if (!ctx.chat || ctx.chat.type === "private") {
+      await ctx.reply("Run this inside the group or channel you want to post products to (add me there as admin first).").catch(() => undefined);
+      return;
+    }
+    const title = "title" in ctx.chat ? (ctx.chat.title ?? null) : null;
+    await registerPostTarget(String(ctx.chat.id), title, ctx.from ? String(ctx.from.id) : undefined);
+    await ctx.reply("✅ Registered! Product posts from the admin panel will appear here.").catch(() => undefined);
+  });
+  bot.command("unregistergroup", async (ctx) => {
+    if (!(await chatRunByBotAdmin(ctx))) return;
+    if (!ctx.chat || ctx.chat.type === "private") return;
+    await removePostTargetByChat(String(ctx.chat.id));
+    await ctx.reply("✅ Unregistered — no more product posts here.").catch(() => undefined);
+  });
+
+  // ── Resolve DB user for private chats ──
+  bot.use(async (ctx, next) => {
+    if (ctx.chat?.type !== "private" || !ctx.from) return;
+    // The grammY session is keyed by CHAT, not by user, and every wizard field
+    // on it (buy quantity, replacement selection, the pasted TOTP secret) belongs
+    // to ONE person. In a private chat the two ids are the same, so this is
+    // always true today — it is here so that a future group/channel feature
+    // cannot attach a DB user to a session other people also write to.
+    if (String(ctx.chat.id) !== String(ctx.from.id)) return;
+    const payload = ctx.message?.text?.startsWith("/start") ? ctx.message.text.split(" ")[1] : undefined;
+    const { user, isNew } = await resolveTelegramUser({
+      telegramId: BigInt(ctx.from.id),
+      firstName: ctx.from.first_name,
+      lastName: ctx.from.last_name,
+      username: ctx.from.username,
+      locale: ctx.from.language_code,
+      startPayload: payload,
+    });
+    ctx.user = user;
+    ctx.session.isNewUser = isNew;
+    // Banned users can't use the bot.
+    if ((user as { status?: string }).status === "BANNED" && !ctx.message?.successful_payment) {
+      await ctx.reply("🚫 Your access has been suspended. Contact support if you think this is a mistake.").catch(() => undefined);
+      return;
+    }
+
+    // ── Maintenance mode ──
+    // Admins always get through, otherwise enabling it would lock the operator
+    // out of the very panel that turns it back off. /admin stays reachable for
+    // the same reason, before the passcode session exists.
+    const cmd = ctx.message?.text ?? "";
+    // Both lookups at once: this runs on every single update.
+    const [isAdminHere, maint] = await Promise.all([isBotAdmin(ctx.from.id), getMaintenance()]);
+    if (!isAdminHere && !cmd.startsWith("/admin") && !ctx.message?.successful_payment) {
+      if (maint.enabled) {
+        await ctx.reply(maint.message, { parse_mode: "HTML" }).catch(() => undefined);
+        return;
+      }
+    }
+    await next();
+  });
+
+  // Telegram rejects messages with custom emoji the bot doesn't own. Strip
+  // <tg-emoji> tags back to their fallback glyph so the message still sends.
+  const stripEmoji = (html: string): string => html.replace(/<tg-emoji[^>]*>(.*?)<\/tg-emoji>/g, "$1");
+
+  const render = async (ctx: Ctx, view: View, edit: boolean): Promise<number | undefined> => {
+    const opts = { parse_mode: "HTML" as const, reply_markup: view.kb };
+    let sentId: number | undefined;
+    // Tag-aware: slicing raw HTML cut through <a>/<tg-emoji>, Telegram refused
+    // the caption and the fallbacks below lost the photo and the buttons.
+    const cap = (t: string) => capTelegramHtml(t, 1024);
+    const plainOf = (t: string) => stripTelegramHtml(t);
+
+    // Telegram cannot turn a photo message into a text one or the reverse, and
+    // this branch ignored `edit` completely whenever a view had a photo. So
+    // tapping Buy Now on a product card left the card sitting above the
+    // quantity picker, and the same happened at every photo/text boundary.
+    // When a true in-place edit is impossible, remove the old message so the
+    // screen still advances instead of accumulating.
+    const prev = ctx.callbackQuery?.message;
+    if (edit && prev) {
+      const prevIsPhoto = "photo" in prev && Boolean(prev.photo);
+      const nextIsPhoto = Boolean(view.photo);
+      if (prevIsPhoto !== nextIsPhoto || nextIsPhoto) {
+        await ctx.deleteMessage().catch(() => undefined);
+        edit = false; // the old message is gone; this must be a fresh send
+      }
+    }
+
+    if (view.photo) {
+      try {
+        const m = await ctx.replyWithPhoto(view.photo, { caption: cap(view.text), parse_mode: "HTML", reply_markup: view.kb });
+        return m.message_id;
+      } catch (e) {
+        // Retry without custom emoji first (bot may not own them), then plain.
+        if (e instanceof GrammyError && e.description.includes("CUSTOM_EMOJI")) {
+          try { const m = await ctx.replyWithPhoto(view.photo, { caption: cap(stripEmoji(view.text)), parse_mode: "HTML", reply_markup: view.kb }); return m.message_id; } catch { /* fall through */ }
+        }
+        // Keep the buttons on every fallback — a card without them strands the user.
+        const m = await ctx.reply(capTelegramHtml(stripEmoji(view.text), 4096), opts)
+          .catch(() => ctx.reply(plainOf(view.text).slice(0, 4096), { reply_markup: view.kb }).catch(() => undefined));
+        return m?.message_id;
+      }
+    }
+    // Telegram hard-caps a text message at 4096 chars. Views that list one row per
+    // delivered unit could exceed it, and the failure mode was the user getting
+    // NOTHING at all — the last fallback below had no catch either.
+    const TG_MAX = 4096;
+    const fit = (t: string) => capTelegramHtml(t, TG_MAX, "\n\n<i>…truncated</i>");
+    const send = async (text: string): Promise<void> => {
+      if (edit && ctx.callbackQuery?.message) {
+        await ctx.editMessageText(fit(text), opts);
+      } else {
+        const m = await ctx.reply(fit(text), opts);
+        sentId = m.message_id;
+      }
+    };
+    try {
+      await send(view.text);
+    } catch (e) {
+      if (e instanceof GrammyError && e.description.includes("message is not modified")) return sentId;
+      // Most likely an unowned custom emoji — retry with tg-emoji stripped.
+      try { await send(stripEmoji(view.text)); }
+      catch {
+        const m = await ctx.reply(fit(stripEmoji(view.text)), opts)
+          .catch(() => ctx.reply(plainOf(view.text).slice(0, TG_MAX), { reply_markup: view.kb }).catch(() => undefined));
+        sentId = m?.message_id;
+      }
+    }
+    return sentId;
+  };
+
+  const trackText = async (userId: string, orderNumber: string): Promise<string> => {
+    const o = await getOrderTracking(userId, orderNumber);
+    if (!o) return "❌ No order with that number on your account. Check 📦 My orders for the exact number.";
+    const st: Record<string, string> = { PENDING_PAYMENT: "⌛ Awaiting payment", PAID: "💳 Paid — delivering", PENDING_FULFILLMENT: "🕐 Paid — being prepared by our team", AWAITING_STOCK: "📦 Paid — waiting for stock", COMPLETED: "✅ Delivered", CANCELLED: "🚫 Cancelled", EXPIRED: "⌛ Expired (unpaid)", REFUNDED: "↩️ Refunded", MANUAL_REVIEW: "🔍 Under review" };
+    const pay = o.payments[0];
+    const lines = [
+      `🔎 <b>Order ${escapeHtml(o.orderNumber)}</b>`,
+      `Status: <b>${st[o.status] ?? o.status}</b>`,
+      `Placed: ${o.createdAt.toISOString().slice(0, 16).replace("T", " ")} UTC${o.paidAt ? ` · Paid: ${o.paidAt.toISOString().slice(0, 16).replace("T", " ")} UTC` : ""}`,
+      `Total: <b>${fmt(Math.max(0, o.subtotalMinor - o.discountMinor), o.currency)}</b>${pay ? ` via ${pay.provider.toLowerCase()}` : ""}`,
+      "",
+      "<b>Items</b>",
+      ...o.items.map((i) => `• ${escapeHtml(i.productNameSnap)}${i.variantNameSnap.toLowerCase() === "standard" ? "" : ` · ${escapeHtml(i.variantNameSnap)}`} ×${i.quantity} — ${i.fulfilledAt ? "✅ delivered" : "⏳ pending"}${i.expiresAt ? ` · valid till ${i.expiresAt.toISOString().slice(0, 10)}` : ""}`),
+      "",
+      "<i>Delivered values are in 📦 My orders (never shown here, so this message is safe to forward).</i>",
+    ];
+    return lines.join("\n");
+  };
+
+  const giftClaimText = (r: Awaited<ReturnType<typeof claimGift>>): string => {
+    if (r.ok) {
+      return r.fromSelf
+        ? `↩️ That was your own gift code — <b>${fmt(r.amountMinor, r.currency)}</b> is back in your wallet. New balance: <b>${fmt(Number(r.newBalanceMinor), r.currency)}</b>.`
+        : `🎁 <b>Gift redeemed!</b>\n\n<b>${fmt(r.amountMinor, r.currency)}</b> has been added to your wallet. New balance: <b>${fmt(Number(r.newBalanceMinor), r.currency)}</b>. Enjoy! 💖`;
+    }
+    return r.reason === "ALREADY_CLAIMED" ? "⚠️ That gift code has already been redeemed."
+      : r.reason === "EXPIRED" ? "⌛ That gift code has expired — the sender got the balance back."
+      : "❌ That doesn't look like a valid gift code. Check it and try again.";
+  };
+
+  /**
+   * The home card, exactly once: /start and /menu replace the previous home
+   * card instead of stacking a new one under it. The command message itself
+   * goes too — a chat full of "/start" lines is nobody's idea of a shop.
+   */
+  const showHome = async (ctx: Ctx): Promise<void> => {
+    await ctx.deleteMessage().catch(() => undefined);
+    if (ctx.chat && ctx.session.menuMsgId) {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.session.menuMsgId).catch(() => undefined);
+      ctx.session.menuMsgId = undefined;
+    }
+    const id = await render(ctx, await views.menuView(ctx.user), false);
+    if (id) ctx.session.menuMsgId = id;
+  };
+
+  /**
+   * Replace the card a callback came from with a payment card — with render()'s
+   * guards. A bare editMessageText throws when the tapped message is a PHOTO
+   * (a product card) because Telegram cannot turn a photo into text, and again
+   * on "message is not modified". Both threw AFTER the order had already been
+   * created, so the customer was left with a live order and no way to pay it.
+   * Returns the message the card ended up in, so it can be remembered.
+   */
+  const editCard = async (ctx: Ctx, text: string, kb: InlineKeyboard): Promise<{ message_id: number } | undefined> => {
+    const opts = { parse_mode: "HTML" as const, reply_markup: kb };
+    const prev = ctx.callbackQuery?.message;
+    const prevIsPhoto = Boolean(prev && "photo" in prev && prev.photo);
+    if (prev && !prevIsPhoto) {
+      try {
+        const edited = await ctx.editMessageText(text, opts);
+        return typeof edited === "object" ? edited : prev;
+      } catch (e) {
+        if (e instanceof GrammyError && e.description.includes("message is not modified")) return prev;
+        // Anything else (photo message, message too old) — send a fresh card.
+      }
+    } else if (prevIsPhoto) {
+      await ctx.deleteMessage().catch(() => undefined);
+    }
+    return ctx.reply(text, opts).catch(() => undefined);
+  };
+
+  /**
+   * The crypto payment card: a unique address, the exact amount, the network,
+   * and a QR of the address. One per payment; the flow helpers keep it as the
+   * anchor until the payment settles.
+   */
+  const sendCryptoCard = async (ctx: Ctx, card: CryptoCard, net: CryptoNetwork): Promise<{ message_id: number } | undefined> => {
+    const isTopup = card.kind === "topup";
+    const mins = Math.max(1, Math.round((new Date(card.expiresAt).getTime() - Date.now()) / 60_000));
+    const caption = [
+      `${networkEmoji(net.code, net.emoji)} <b>Pay with ${escapeHtml(net.asset)} · ${escapeHtml(net.chain)}</b>`,
+      isTopup ? `💳 Wallet deposit <b>${fmt(card.owedMinor, card.currency)}</b>` : `🧾 Order <b>${escapeHtml(card.orderNumber)}</b> — ${fmt(card.owedMinor, card.currency)}`,
+      "",
+      "┏━━━━━━━━━━━━━━━━━━",
+      `┃ ${pe("money")} <b>Send exactly</b>`,
+      `┃ <code>${escapeHtml(card.payAmount)}</code> ${escapeHtml(net.asset)}`,
+      "┃",
+      `┃ ${pe("deposit")} <b>To this address</b> <i>(yours only)</i>`,
+      `┃ <code>${escapeHtml(card.payAddress)}</code>`,
+      ...(card.payinExtraId ? ["┃", `┃ 📝 <b>Memo / Tag — REQUIRED</b>`, `┃ <code>${escapeHtml(card.payinExtraId)}</code>`] : []),
+      "┗━━━━━━━━━━━━━━━━━━",
+      "",
+      `🔗 Network: <b>${escapeHtml(net.chain)}</b> — send <b>only</b> on this network.`,
+      card.provider === "terminal"
+        ? `✅ <b>Auto-verification enabled</b> — credited automatically after <b>${card.confirmations ?? 1} confirmation${(card.confirmations ?? 1) === 1 ? "" : "s"}</b>. Nothing to paste.`
+        : "✅ Confirms <b>automatically</b> a few minutes after it lands — nothing to paste.",
+      `⏳ Pay within <b>${mins} minutes</b>.`,
+      "💡 From an exchange? Add the withdrawal fee on top so the <b>full amount</b> arrives.",
+    ].join("\n");
+    const kb = new InlineKeyboard()
+      .copyText(`📋 Copy address`, card.payAddress).row()
+      .copyText(`📋 Copy amount — ${card.payAmount}`, card.payAmount).row();
+    if (card.payinExtraId) kb.copyText(`📋 Copy memo — ${card.payinExtraId}`, card.payinExtraId).row();
+    kb.text("🔄 Check payment", isTopup ? cb("wal", "cryptochk", card.refId) : cb("ord", "cryptochk", card.refId)).row();
+    if (isTopup) kb.text("✖️ Cancel", cb("wal", "view")).text("🏠 Menu", "mnu:homenew");
+    else kb.text("✖️ Cancel", cb("ord", "cryptocancel", card.refId)).text("🏠 Menu", "mnu:homenew");
+    try {
+      const png = await QRCode.toBuffer(card.payAddress, { width: 512, margin: 2, color: { dark: "#000000", light: "#FFFFFF" } });
+      return await ctx.replyWithPhoto(new InputFile(png, "crypto-pay.png"), { caption, parse_mode: "HTML", reply_markup: kb });
+    } catch {
+      return ctx.reply(caption, { parse_mode: "HTML", reply_markup: kb }).catch(() => undefined);
+    }
+  };
+
+  /** Human line for a polled NOWPayments status. */
+  const cryptoStatusLine = (r: { status: string; actuallyPaid: string; payAmount: string; payCurrency: string }): string => {
+    const unit = r.payCurrency.toUpperCase();
+    switch (r.status) {
+      case "waiting": return "⏳ Not seen on the network yet. Send the exact amount to the address and check again in a minute.";
+      case "confirming": return "🔄 Seen on-chain — waiting for network confirmations. Almost there!";
+      case "confirmed":
+      case "sending": return "✅ Confirmed on-chain — crediting now, a moment please.";
+      case "partially_paid": return `⚠️ Received ${r.actuallyPaid} of ${r.payAmount} ${unit}. Send the remaining amount to the SAME address and it completes automatically.`;
+      case "finished": return "✅ Payment complete!";
+      case "expired": return "❌ This payment window expired. Start again from your cart.";
+      case "failed": return "❌ The payment failed. Please contact support.";
+      case "refunded": return "↩️ This payment was refunded.";
+      default: return `Status: ${r.status}`;
+    }
+  };
+
+  // ── Commands ──
+  bot.command("start", async (ctx) => {
+    const payload = ctx.match.trim();
+    if (payload.startsWith(PRODUCT_DEEPLINK_PREFIX)) {
+      const productId = await getProductIdBySlug(payload.slice(PRODUCT_DEEPLINK_PREFIX.length));
+      if (productId) { ctx.session.buyProductId = productId; return render(ctx, await views.productView(ctx.user, productId), false); }
+    }
+    // A gift code shared as a link: t.me/<bot>?start=gift_XXXXX-XXXXX
+    if (payload.startsWith("gift_")) {
+      const r = await claimGift(ctx.user.id, payload.slice(5));
+      await ctx.deleteMessage().catch(() => undefined);
+      await ctx.reply(giftClaimText(r), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")).text("🛍 Shop", cb("shp", "home", 1)) });
+      return showHome(ctx);
+    }
+    // Deep links so an announcement button can open ANY section of the bot.
+    switch (payload) {
+      case "shop": return render(ctx, await views.shopHomeView(ctx.user, 1), false);
+      case "categories": return render(ctx, await views.categoryGridView(ctx.user), false);
+      case "deals": return render(ctx, await views.dealsView(ctx.user), false);
+      case "refer": return render(ctx, await views.referralView(ctx.user, ctx.me.username), false);
+      case "spin": return render(ctx, await views.spinView(ctx.user), false);
+      case "mission": return render(ctx, await views.missionView(ctx.user), false);
+      case "tier": return render(ctx, await views.tierView(ctx.user), false);
+      case "account": return render(ctx, await views.profileView(ctx.user), false);
+      case "topup": return render(ctx, await views.walletView(ctx.user), false);
+      case "support": return render(ctx, await views.supportHomeView(ctx.user), false);
+      case "orders": return render(ctx, await views.ordersView(ctx.user, 1), false);
+      default: break;
+    }
+    // The celebration and the warm welcome are for the FIRST visit. A returning
+    // customer tapping /start used to get the confetti, a "Welcome" paragraph
+    // and then the home card that says "Welcome back" again — three messages
+    // repeating one another, every single time. Now: first visit = one
+    // welcome + the home card; every later /start = the home card alone,
+    // replacing the previous one.
+    if (ctx.session.isNewUser) {
+      if (config.CELEBRATION_EMOJI) {
+        const em = await ctx.reply(config.CELEBRATION_EMOJI).catch(() => undefined);
+        if (em && ctx.chat) await rememberChatClutter(ctx.chat.id, em.message_id);
+      }
+      const who = greetName(ctx.user);
+      const welcomeText = [
+        `👋 <b>Welcome, ${who}!</b> 🙏`,
+        `It's a real pleasure to have you at <b>${escapeHtml(config.STORE_NAME)}</b>.`,
+        "",
+        "💱 Your currency is set to <b>USD</b> — switch anytime from the menu.",
+      ].join("\n");
+      const emojiPrefix = config.CUSTOM_EMOJI_ID ? `<tg-emoji emoji-id="${config.CUSTOM_EMOJI_ID}">✨</tg-emoji> ` : "";
+      let welcomeMsg;
+      try {
+        welcomeMsg = await ctx.reply(`${emojiPrefix}${welcomeText}`, { parse_mode: "HTML" });
+      } catch {
+        welcomeMsg = await ctx.reply(welcomeText, { parse_mode: "HTML" }).catch(() => undefined);
+      }
+      // Cleared on their first delivery, so it never sits above their keys.
+      if (welcomeMsg && ctx.chat) await rememberChatClutter(ctx.chat.id, welcomeMsg.message_id);
+      ctx.session.isNewUser = false;
+    }
+    return showHome(ctx);
+  });
+  bot.command("menu", async (ctx) => showHome(ctx));
+  // /track GIS-2026-000123 — status of one order, no secrets, shareable.
+  bot.command("track", async (ctx) => {
+    const num = ctx.match.trim().toUpperCase();
+    if (!num) {
+      ctx.session.awaiting = "track_order";
+      return ctx.reply("🔎 Send the order number you want to track (e.g. <code>GIS-2026-000123</code>):", { parse_mode: "HTML" });
+    }
+    return ctx.reply(await trackText(ctx.user.id, num), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home") });
+  });
+  bot.command("shop", async (ctx) => render(ctx, await views.shopHomeView(ctx.user, 1), false));
+  bot.command("cart", async (ctx) => render(ctx, await views.cartViewKb(ctx.user), false));
+  bot.command("orders", async (ctx) => render(ctx, await views.ordersView(ctx.user, 1), false));
+  bot.command("wallet", async (ctx) => render(ctx, await views.walletView(ctx.user), false));
+  bot.command("support", async (ctx) => render(ctx, await views.supportHomeView(ctx.user), false));
+  bot.command("help", async (ctx) => render(ctx, await views.helpView(), false));
+  bot.command("api", async (ctx) => render(ctx, await views.apiKeysView(ctx.user), false));
+  bot.command("replace", async (ctx) => render(ctx, await views.replaceListView(ctx.user), false));
+  bot.command(["language", "lang"], async (ctx) => render(ctx, views.languageView(ctx.user), false));
+  bot.command("referral", async (ctx) => render(ctx, await views.referralView(ctx.user, ctx.me.username), false));
+  // Secret admin trigger — /Shriji (case-insensitive). /admin no longer opens the panel.
+  bot.hears(/^\/shriji(?:@\S+)?(?:\s|$)/i, async (ctx) => adminCommand(ctx));
+
+  // ── VIP pricing admin commands (bot-admin only) ──
+  const adminOnly = async (ctx: Ctx): Promise<boolean> => {
+    if (await isBotAdmin(ctx.from?.id)) return true;
+    await ctx.reply("⛔ Admins only. Use /admin first.").catch(() => undefined);
+    return false;
+  };
+  bot.command("setprice", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const [uid, pid, price] = ctx.match.trim().split(/\s+/);
+    const amt = Math.round(Number.parseFloat(price ?? "") * 100);
+    if (!uid || !pid || !Number.isFinite(amt) || amt <= 0) return ctx.reply("Usage: /setprice &lt;user_id&gt; &lt;product_id&gt; &lt;price&gt;", { parse_mode: "HTML" });
+    const u = await resolveUserByTelegramId(uid);
+    if (!u) return ctx.reply("User not found (they must have used the bot).");
+    await setUserPrice(u.id, pid, amt);
+    return ctx.reply(`✅ VIP price set for ${u.label} on product ${pid}: ${price}`);
+  });
+  bot.command("removeprice", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const [uid, pid] = ctx.match.trim().split(/\s+/);
+    if (!uid || !pid) return ctx.reply("Usage: /removeprice <user_id> <product_id>");
+    const u = await resolveUserByTelegramId(uid);
+    if (!u) return ctx.reply("User not found.");
+    await removeUserPrice(u.id, pid);
+    return ctx.reply(`✅ VIP price removed for ${u.label} on ${pid}.`);
+  });
+  bot.command("prices", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const uid = ctx.match.trim();
+    if (!uid) return ctx.reply("Usage: /prices <user_id>");
+    const u = await resolveUserByTelegramId(uid);
+    if (!u) return ctx.reply("User not found.");
+    const rows = await listUserPrices(u.id);
+    if (rows.length === 0) return ctx.reply(`${u.label} has no VIP prices.`);
+    const lines = rows.map((r) => `• ${escapeHtml(r.productName)} — ${(r.amountMinor / 100).toFixed(2)}`);
+    return ctx.reply(`💰 <b>VIP prices for ${escapeHtml(u.label)}</b>\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+  bot.command("storeprice", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const [pid, price] = ctx.match.trim().split(/\s+/);
+    const amt = Math.round(Number.parseFloat(price ?? "") * 100);
+    if (!pid || !Number.isFinite(amt) || amt <= 0) return ctx.reply("Usage: /storeprice <product_id> <default_price>");
+    await setStoreDefaultPrice(pid, amt);
+    return ctx.reply(`✅ Default price for product ${pid} set to ${price} (INR, USD auto-derived).`);
+  });
+  bot.command("setvip", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const u = await resolveUserByTelegramId(ctx.match.trim());
+    if (!u) return ctx.reply("Usage: /setvip <user_id> (user must have used the bot)");
+    await setVip(u.id, true);
+    return ctx.reply(`👑 ${u.label} is now a VIP member.`);
+  });
+  bot.command("removevip", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const u = await resolveUserByTelegramId(ctx.match.trim());
+    if (!u) return ctx.reply("Usage: /removevip <user_id>");
+    await setVip(u.id, false);
+    return ctx.reply(`✅ ${u.label} is no longer a VIP.`);
+  });
+
+  if (isDev()) {
+    // Dev-only wallet top-up so checkout is testable end-to-end.
+    bot.command("devtopup", async (ctx) => {
+      const amount = Number.parseInt(ctx.match.trim(), 10);
+      if (!Number.isFinite(amount) || amount <= 0) return ctx.reply("Usage: /devtopup <amount-minor-units>");
+      const balance = await adjustWallet({
+        userId: ctx.user.id,
+        amountMinor: BigInt(amount),
+        type: "ADJUSTMENT",
+        note: "dev top-up",
+      });
+      return ctx.reply(`✅ Balance: ${fmt(balance, ctx.user.currency)}`);
+    });
+  }
+
+  // ── Admin sends a photo to set a product image ──
+  // ── Admin uploads stock as a .txt file (bulk keys / accounts) ──
+  bot.on("message:document", async (ctx) => {
+    // Admin files (stock .txt, product image sent as a file, testimonials.json).
+    if (ctx.session.awaiting && (await isBotAdmin(ctx.from?.id)) && (await handleAdminDocument(ctx))) return;
+    // Customers: a screenshot sent "as file" used to vanish without a reply.
+    const aw = ctx.session.awaiting;
+    const doc = ctx.message.document;
+    const isImage = (doc.mime_type ?? "").startsWith("image/") || /\.(jpe?g|png|webp|gif|heic)$/i.test(doc.file_name ?? "");
+    if (aw === "replace_proof" || aw === "ticket_reply" || aw === "ticket" || aw === "support_chat") {
+      ctx.session.awaiting = aw; // keep the step open for the photo
+      await ctx.reply(isImage
+        ? "📸 Please send the screenshot as a <b>photo</b> (tap 📎 → Photo / Gallery), not as a file — then our team can see it."
+        : "📎 Files can't be attached here. Please send a <b>screenshot as a photo</b>, or describe the problem in text.", { parse_mode: "HTML" });
+      return;
+    }
+    if (aw === "upi_ref" || aw === "wallet_inr_utr") {
+      ctx.session.awaiting = aw;
+      await ctx.reply("📄 Please <b>type the 12-digit UTR / reference number</b> from your UPI app instead of sending a file.", { parse_mode: "HTML" });
+      return;
+    }
+    if (aw === "binance_txnid" || aw === "wallet_free_txn") {
+      ctx.session.awaiting = aw;
+      await ctx.reply("📄 Please <b>paste the Binance Order ID</b> as text instead of sending a file.", { parse_mode: "HTML" });
+    }
+  });
+
+  bot.on("message:photo", async (ctx) => {
+    // Admin attaching an image to a broadcast. The outbox already supported
+    // photo sends end to end — OutboxOptions.photo, both enqueue helpers and the
+    // worker's sendPhoto — but the compose step only ever read text, so there
+    // was no way to put an image into a broadcast.
+    // Admin attaching an image to a special sale / campaign. Same outbox path as
+    // a broadcast — sendBroadcast and scheduleBroadcast both take imageUrl — so
+    // scheduled daily and weekly campaigns carry the image too.
+    if (ctx.session.awaiting?.startsWith("sale_") && ctx.session.saleDraft && (await isBotAdmin(ctx.from?.id))) {
+      const photos = ctx.message.photo;
+      const fileId = photos[photos.length - 1]?.file_id;
+      if (fileId) {
+        ctx.session.saleDraft = { ...ctx.session.saleDraft, photo: fileId };
+        const cap = (ctx.message.caption ?? "").trim();
+        if (cap) ctx.session.saleDraft = { ...ctx.session.saleDraft, body: entitiesToTelegramHtml(ctx.message.caption ?? "", ctx.message.caption_entities).trim() };
+        await ctx.reply(
+          "🖼 <b>Image attached to the sale.</b> Carry on with the next step — it will be sent with the announcement, including scheduled ones.",
+          { parse_mode: "HTML" },
+        );
+        return;
+      }
+    }
+    if ((ctx.session.awaiting === "admin_broadcast" || ctx.session.awaiting === "admin_bc_photo") && (await isBotAdmin(ctx.from?.id))) {
+      const photos = ctx.message.photo;
+      const fileId = photos[photos.length - 1]?.file_id; // largest rendition
+      if (fileId) {
+        ctx.session.bcPhoto = fileId;
+        // Sent with parse_mode HTML: a raw caption with "&" or "<" made every
+        // send fail and the broadcast went out WITHOUT the photo. Keep its
+        // formatting and premium emoji the same way text steps do.
+        const cap = (ctx.message.caption ?? "").trim();
+        if (cap) ctx.session.bcBody = entitiesToTelegramHtml(ctx.message.caption ?? "", ctx.message.caption_entities).trim();
+        // Telegram caps a photo caption at 1024 characters; a longer body would
+        // make sendPhoto fail for every recipient.
+        const body = ctx.session.bcBody ?? "";
+        ctx.session.awaiting = body ? null : "admin_broadcast";
+        await ctx.reply(
+          body
+            ? (body.length > 1024
+                ? `🖼 Photo attached — but the text is ${body.length} characters and a photo caption can only be 1024. Shorten it, or send without the photo.`
+                : "🖼 <b>Photo attached.</b> Now choose how to send it:")
+            : "🖼 <b>Photo attached.</b> Now send the broadcast <b>text</b>:",
+          {
+            parse_mode: "HTML",
+            reply_markup: body && body.length <= 1024
+              ? new InlineKeyboard()
+                  .text("📨 Send now", cb("adm", "bcsend")).row()
+                  .text("🗑 Remove photo", cb("adm", "bcnophoto")).row()
+                  .text("✖️ Cancel", cb("adm", "home"))
+              : undefined,
+          },
+        );
+        return;
+      }
+    }
+    // Customer submitting a replacement / support screenshot.
+    if (ctx.session.awaiting === "replace_proof") {
+      const photos = ctx.message.photo;
+      await submitReplaceOrTicket(ctx, photos[photos.length - 1]?.file_id);
+      return;
+    }
+    // Customer attaching a screenshot to an open ticket reply.
+    if (ctx.session.awaiting === "ticket_reply" && ctx.session.ticketId) {
+      ctx.session.awaiting = null;
+      const photos = ctx.message.photo;
+      const r = await customerReplyTicket(ctx.user.id, ctx.session.ticketId, ctx.message.caption?.slice(0, 1000) || "(screenshot)", photos[photos.length - 1]?.file_id);
+      ctx.session.ticketId = undefined;
+      await ctx.reply(r.ok ? `📨 Sent to support on ticket <b>${r.ticketNumber}</b>. We'll reply here.` : "⚠️ That ticket is no longer open.", { parse_mode: "HTML" });
+      return;
+    }
+    // A payment screenshot while we wait for a reference number used to be
+    // ignored without a word, so the customer thought it was being checked.
+    const aw = ctx.session.awaiting;
+    // Live support chat / a new ticket: the screenshot reaches the team.
+    if (aw === "support_chat" || aw === "ticket") {
+      const photos = ctx.message.photo;
+      const fileId = photos[photos.length - 1]?.file_id;
+      const who = ctx.user.telegramHandle ? `@${ctx.user.telegramHandle}` : (ctx.user.firstName ?? String(ctx.from?.id ?? ""));
+      const caption = escapeHtml((ctx.message.caption ?? "").slice(0, 700));
+      if (aw === "ticket") {
+        ctx.session.awaiting = null; // one ticket — the next message must not open another
+        const ticket = await createTicket(ctx.user.id, "OTHER", ctx.message.caption?.slice(0, 2000) || "(screenshot)").catch(() => null);
+        await enqueueAdminAlert(`🎫 <b>New ticket${ticket ? ` #${ticket.ticketNumber}` : ""}</b> — ${escapeHtml(who)} (id <code>${ctx.from?.id}</code>)${caption ? `\n${caption}` : ""}`, [{ text: "↩️ Reply", callbackData: `adm:dm:${ctx.user.id}` }], fileId).catch(() => undefined);
+        return ctx.reply(ticket ? `🎫 Ticket <b>#${ticket.ticketNumber}</b> created with your screenshot. Support will reply here.` : "📨 Screenshot sent to our team. They'll reply here.", { parse_mode: "HTML" });
+      }
+      await enqueueAdminAlert(`💬 <b>Support chat</b> — screenshot from ${escapeHtml(who)} (id <code>${ctx.from?.id}</code>)${caption ? `\n${caption}` : ""}`, [{ text: "↩️ Reply", callbackData: `adm:dm:${ctx.user.id}` }], fileId).catch(() => undefined);
+      ctx.session.awaiting = "support_chat";
+      return ctx.reply("✅ Screenshot sent to our team — we'll reply here shortly. (🔚 tap End chat to exit)", { reply_markup: new InlineKeyboard().text("🔚 End chat", "sup:endchat") });
+    }
+    if (aw === "upi_ref" || aw === "wallet_inr_utr") {
+      await ctx.reply("📸 Thanks! Screenshots can't be verified automatically — please <b>type the 12-digit UTR / reference number</b> from your UPI app (open the payment → transaction details) and send it here.", { parse_mode: "HTML" });
+      return;
+    }
+    if (aw === "binance_txnid" || aw === "wallet_free_txn") {
+      await ctx.reply("📸 Thanks! Screenshots can't be verified automatically — please <b>copy the Order ID</b> from the Binance payment receipt and paste it here as text.", { parse_mode: "HTML" });
+      return;
+    }
+    if (aw !== "admin_p_image") return;
+    if (!(await isBotAdmin(ctx.from?.id))) return;
+    const photos = ctx.message.photo;
+    const fileId = photos[photos.length - 1]?.file_id;
+    if (fileId) await setProductImageFromFileId(ctx, fileId);
+  });
+
+  // ── Telegram Stars: payment succeeded → fulfil the order ──
+  bot.on("message:successful_payment", async (ctx) => {
+    const sp = ctx.message.successful_payment;
+    const orderId = sp.invoice_payload;
+    try {
+      const r = await confirmStarsPayment(orderId);
+      await ctx.reply(
+        successCard("Payment Received", [`✅ Paid with ⭐ Telegram Stars`, `📦 Delivered ${num(r.delivered)} item(s)`, `🙏 Thank you so much, ${greetName(ctx.user)} — it is an honour to serve you!`]),
+        { parse_mode: "HTML" },
+      );
+    } catch (e) {
+      // The Stars are already taken. Never leave that silent: credit the order
+      // value to the wallet when the order was closed meanwhile, and always
+      // tell the admins with the charge id so it can be traced or refunded.
+      const credit = await creditFailedStarsPayment(orderId, sp.telegram_payment_charge_id).catch(() => null);
+      await enqueueAdminAlert(
+        [
+          "⭐ <b>Stars payment needs attention</b>",
+          `👤 ${greetName(ctx.user)} · <code>${ctx.from?.id ?? "?"}</code>`,
+          `🧾 Order <code>${escapeHtml(orderId)}</code> · ${num(sp.total_amount)} ⭐`,
+          `🔖 Charge <code>${escapeHtml(sp.telegram_payment_charge_id)}</code>`,
+          credit?.credited ? `💳 Credited ${fmt(credit.amountMinor, credit.currency)} to the customer's wallet.` : `⚠️ ${escapeHtml(String((e as Error)?.message ?? e).slice(0, 200))}`,
+        ].join("\n"),
+      ).catch(() => undefined);
+      await ctx.reply(
+        credit?.credited
+          ? `⭐ Payment received, but that order had already closed — so <b>${fmt(credit.amountMinor, credit.currency)}</b> was added to your wallet instead. Use it on your next order anytime. 💳`
+          : "⭐ Payment received — our team will deliver your order shortly.",
+        { parse_mode: "HTML" },
+      ).catch(() => undefined);
+    }
+  });
+
+  // ── Free-text conversations (search / ticket) ──
+  bot.on("message:text", async (ctx) => {
+    const awaiting = ctx.session.awaiting;
+    ctx.session.awaiting = null;
+    if (awaiting && (awaiting.startsWith("admin_") || awaiting.startsWith("sale_") || awaiting === "maint_msg")) {
+      const handled = await handleAdminText(ctx, awaiting);
+      if (handled) return;
+    }
+    if (awaiting === "review_comment") {
+      const rid = ctx.session.reviewId ?? "";
+      const body = ctx.message.text.trim().slice(0, 1000);
+      if (!rid) return; // no pending review — fall through to normal handling
+      ctx.session.reviewId = undefined;
+      await addReviewComment(rid, body);
+      await enqueueAdminAlert(`💬 <b>Review comment</b> — ${greetName(ctx.user)}\n\n${escapeHtml(body).slice(0, 600)}`).catch(() => undefined);
+      return ctx.reply(
+        `💖 <b>Thank you, ${greetName(ctx.user)}!</b>\n\nYour words have been sent straight to our team. We truly appreciate you taking the time. 🙏✨`,
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🛍 Shop again", cb("shp", "home", 1)).text("🏠 Menu", "mnu:home") },
+      );
+    }
+    if (awaiting === "keys_search") {
+      const q = ctx.message.text.trim().slice(0, 40);
+      return render(ctx, await views.myKeysSearchView(ctx.user, q), false);
+    }
+    if (awaiting === "replace_proof") {
+      // They typed instead of sending a photo — keep the claim alive.
+      ctx.session.awaiting = "replace_proof";
+      return ctx.reply(
+        "📷 Please send the screenshot as a <b>photo</b> (attach an image), or tap Submit without one.",
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📨 Submit without screenshot", "rep:nopic").text("✖️ Cancel", "rep:home") },
+      );
+    }
+    if (awaiting === "replace_reason") {
+      ctx.session.replaceReason = ctx.message.text.trim().slice(0, 1000);
+      ctx.session.awaiting = "replace_proof";
+      const viaTicket = ctx.session.replaceViaTicket === true;
+      return ctx.reply(
+        viaTicket
+          ? "📷 <b>Step 2 of 2 — send a screenshot</b>\n\nPlease send a photo showing the problem. It helps our support team understand it quickly and decide what they can do for you.\n\n<i>No screenshot? Tap Send without one.</i>"
+          : "📷 <b>Step 2 of 2 — send a screenshot</b>\n\nPlease send a photo showing the problem (error message, login screen, etc.). This helps our team approve your replacement fast.\n\n<i>No screenshot? Tap Submit without one.</i>",
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text(viaTicket ? "📨 Send without screenshot" : "📨 Submit without screenshot", "rep:nopic").text("✖️ Cancel", "rep:home") },
+      );
+    }
+    if (awaiting === "otp_secret") {
+      // Delete the message holding the secret immediately — chat history is the
+      // one place we genuinely cannot control, so don't leave it sitting there.
+      const raw = ctx.message.text;
+      await ctx.deleteMessage().catch(() => undefined);
+      const clean = raw.replace(/[\s-]/g, "").toUpperCase();
+      if (!clean) {
+        ctx.session.awaiting = "otp_secret";
+        return ctx.reply("That looked empty — paste the Base32 secret key.", {
+          reply_markup: new InlineKeyboard().text("✖️ Cancel", cb("otp", "tool")),
+        });
+      }
+      if (!looksLikeTotpSecret(clean) || generateTotp(clean) === null) {
+        ctx.session.awaiting = "otp_secret";
+        return ctx.reply(
+          [
+            "⚠️ <b>That isn't a valid 2FA secret.</b>",
+            "",
+            "It should be Base32 — letters A–Z and digits 2–7 only, usually 16 or 32 characters.",
+            "If you copied a whole URL by mistake, send just the <code>secret=</code> part.",
+          ].join("\n"),
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Cancel", cb("otp", "tool")) },
+        );
+      }
+      // Encrypted before it touches the session store. The session is persisted in
+      // Redis as JSON, so "never saved" was not true of a plaintext field — and
+      // Redis is the same instance BullMQ uses, i.e. likely persisted to disk.
+      ctx.session.otpSecret = encryptSecret(clean, loadConfig().ENCRYPTION_MASTER_KEY);
+      ctx.session.otpReveal = false;
+      return render(ctx, views.otpToolView(clean, false), false);
+    }
+    if (awaiting === "ticket_reply") {
+      const id = ctx.session.ticketId ?? "";
+      ctx.session.ticketId = undefined;
+      if (!id) return;
+      const r = await customerReplyTicket(ctx.user.id, id, ctx.message.text.trim().slice(0, 2000));
+      return ctx.reply(
+        r.ok ? `📨 Sent to support on ticket <b>${r.ticketNumber}</b>. We'll reply right here. 🙏` : "⚠️ That ticket is no longer open. Tap 🎫 Support to open a new one.",
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📂 View ticket", `tkt:open:${id}`).text("🏠 Menu", "mnu:home") },
+      );
+    }
+    if (awaiting === "wallet_inr_amount") {
+      flowRemember(ctx, ctx.message);
+      const val = Number.parseFloat(ctx.message.text.replace(/[^0-9.]/g, ""));
+      if (!Number.isFinite(val) || val <= 0) {
+        ctx.session.awaiting = "wallet_inr_amount";
+        return flowStep(ctx, () => ctx.reply("Please send a valid amount in ₹, e.g. <code>500</code>", { parse_mode: "HTML" }));
+      }
+      const minor = Math.round(val * 100);
+      ctx.session.inrTopupMinor = minor;
+      const fxRate = await getInrPerUsdt();
+      ctx.session.awaiting = "wallet_inr_utr";
+      const upiId = config.UPI_ID ?? "";
+      const payee = config.UPI_PAYEE_NAME || config.STORE_NAME;
+      const rupees = (minor / 100).toFixed(2);
+      const uri = `upi://pay?pa=${encodeURIComponent(upiId)}&pn=${encodeURIComponent(payee)}&am=${rupees}&cu=INR&tn=${encodeURIComponent(`WALLET-${ctx.user.id.slice(-6)}`)}`;
+      const caption = [
+        "🇮🇳 <b>Add ₹ to your wallet</b>",
+        "",
+        "┏━━━━━━━━━━━━━━━━━━",
+        `┃ 💵 <b>Amount</b>`,
+        `┃ <code>${rupees}</code>`,
+        "┃",
+        `┃ 🆔 <b>UPI ID</b>`,
+        `┃ <code>${upiId}</code>`,
+        `┃ <i>${escapeHtml(payee)}</i>`,
+        "┗━━━━━━━━━━━━━━━━━━",
+        "",
+        "📷 <b>Scan the QR</b> in GPay / PhonePe / Paytm — the amount is pre-filled.",
+        "📋 No QR? Use the copy buttons below.",
+        "",
+        (await getWallet(ctx.user.id).catch(() => null))?.currency === "INR"
+          ? `💰 Your wallet will be credited <b>₹${rupees}</b>`
+          : `💰 Your wallet will be credited <b>$${(Math.round(minor / fxRate) / 100).toFixed(2)}</b>  <i>(${fxRate} INR = 1 USD)</i>`,
+        "",
+        "✅ After paying, paste your <b>UTR number</b> here.",
+        "",
+        "🕐 <b>Please note:</b> UPI is verified <b>manually by our team</b>, so crediting can be delayed.",
+        "⚡ Need it instantly? Use <b>Binance (USDT)</b> — that is credited automatically.",
+      ].join("\n");
+      const kb = new InlineKeyboard()
+        .copyText(`📋 Copy amount — ₹${rupees}`, rupees).row()
+        .copyText(`📋 Copy UPI ID — ${upiId}`, upiId).row()
+        .text("✖️ Cancel", "wal:view");
+      // The QR card replaces the "how much?" prompt and the typed amount, and
+      // is the one thing that stays on screen until the UTR is in.
+      const card = await (async () => {
+        try {
+          const png = await QRCode.toBuffer(uri, { width: 512, margin: 2, color: { dark: "#000000", light: "#FFFFFF" } });
+          return await ctx.replyWithPhoto(new InputFile(png, "upi-topup.png"), { caption, parse_mode: "HTML", reply_markup: kb });
+        } catch {
+          return ctx.reply(caption, { parse_mode: "HTML", reply_markup: kb });
+        }
+      })();
+      await flowStart(ctx, card);
+      return card;
+    }
+    if (awaiting === "wallet_inr_utr") {
+      flowRemember(ctx, ctx.message);
+      const utr = ctx.message.text.trim().slice(0, 64);
+      const minor = ctx.session.inrTopupMinor ?? 0;
+      const rate = await getInrPerUsdt();
+      const usdMinor = Math.max(1, Math.round(minor / rate));
+      // What the customer actually receives: the wallet's own currency.
+      const topupWalletCur = (await getWallet(ctx.user.id).catch(() => null))?.currency ?? "USD";
+      const creditLabel = topupWalletCur === "INR" ? `₹${(minor / 100).toFixed(2)}` : `$${(usdMinor / 100).toFixed(2)}`;
+      // A UPI UTR/RRN is exactly 12 digits. The old check accepted any 6+
+      // characters, so "abcdef" passed straight through to an admin alert.
+      const digits = utr.replace(/\D/g, "");
+      if (digits.length !== 12 || minor <= 0) {
+        ctx.session.awaiting = "wallet_inr_utr";
+        return flowStep(ctx, () => ctx.reply(
+          "Please paste the <b>12-digit UTR</b> from your UPI receipt.\n\nIt's the long reference number on the payment confirmation — digits only.",
+          { parse_mode: "HTML" },
+        ));
+      }
+      // One UTR is one payment. Without this the same reference could be
+      // submitted repeatedly, and each submission raised a fresh approval
+      // request that would credit the wallet again.
+      const already = await hasUpiUtrBeenUsed(digits);
+      if (already) {
+        // Stay armed: the message invites the UTR of the NEW payment, which
+        // was impossible when this dropped the state.
+        ctx.session.awaiting = "wallet_inr_utr";
+        return flowStep(ctx, () => ctx.reply(
+          "⚠️ That UTR has already been submitted.\n\nEach UPI payment can only be credited once. If you've paid again, send the UTR from the <b>new</b> payment, or open 🎫 Support.",
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Cancel", "wal:view") },
+        ));
+      }
+      await markUpiUtrPending(digits);
+      const claimId = await stashUpiTopupClaim({ userId: ctx.user.id, inrMinor: minor, usdMinor, utr: digits });
+      ctx.session.inrTopupMinor = undefined;
+      const who = ctx.user.telegramHandle ? `@${ctx.user.telegramHandle}` : (ctx.user.firstName ?? "customer");
+      await enqueueAdminAlert(
+        [
+          "🇮🇳 <b>UPI wallet top-up to verify</b>",
+          `👤 ${escapeHtml(who)}`,
+          `🆔 <code>${ctx.user.telegramId ?? "—"}</code>`,
+          `💵 Paid: <b>₹${(minor / 100).toFixed(2)}</b>`,
+          `💰 Credit: <b>${creditLabel}</b>${topupWalletCur === "INR" ? " <i>(INR wallet)</i>" : `  <i>(${rate} INR = 1 USD)</i>`}`,
+          `🧾 UTR: <code>${escapeHtml(utr)}</code>`,
+          "",
+          `Check the UTR in your UPI app, then approve to credit their wallet (${topupWalletCur}).`,
+        ].join("\n"),
+        [
+          { text: `✅ Approve — credit ${creditLabel}`, callbackData: `adm:wdok:${claimId}`, style: "success" },
+          { text: "❌ Reject", callbackData: `adm:wdno:${claimId}`, style: "danger" },
+        ],
+      ).catch(() => undefined);
+      // Submitted: the QR card, the prompts and the pasted UTR all go — this
+      // receipt is the one thing left of the conversation.
+      const receipt = await flowEnd(ctx, () => ctx.reply(
+        [
+          "🧾 <b>Thanks — payment submitted!</b>",
+          "",
+          `💵 Paid: <b>₹${(minor / 100).toFixed(2)}</b>`,
+          `💰 You'll receive: <b>${creditLabel}</b>`,
+          `🧾 UTR: <code>${escapeHtml(digits)}</code>`,
+          "",
+          "🧑‍💼 Our team is verifying it now — UPI is approved by hand, so please allow a little time. Your wallet is credited as soon as it clears and you'll get a message here. 🙏",
+          "",
+          "⚡ <i>Tip: Binance (USDT) deposits are credited automatically, with no waiting.</i>",
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")).text("🏠 Menu", "mnu:home") },
+      ));
+      // …and once the credit lands, even the receipt is only in the way.
+      if (ctx.chat) await rememberChatClutter(ctx.chat.id, receipt.message_id);
+      return receipt;
+    }
+    if (awaiting === "binance_txnid") {
+      const orderId = ctx.session.binanceOrderId ?? "";
+      const txn = ctx.message.text.trim().slice(0, 128);
+      // The pasted ID is part of the conversation: it goes with the rest.
+      flowRemember(ctx, ctx.message);
+      if (!orderId) {
+        return flowEnd(ctx, () => ctx.reply("That checkout expired — please start again from your 🛒 Cart."));
+      }
+      // Obvious non-IDs (a stray word, a menu tap) shouldn't be sent to admins.
+      if (txn.length < 6) {
+        ctx.session.awaiting = "binance_txnid";
+        return flowStep(ctx, () => ctx.reply(
+          "🔎 That doesn't look like a Binance <b>Order ID</b>. Open the payment in Binance, copy the Order ID from the receipt and paste it here.",
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("⚠️ I have paid — need help", `ord:binancehelp:${orderId}`) },
+        ));
+      }
+      // "Verifying…" replaces the prompt and the paste; the card stays until
+      // the verdict is in.
+      await flowStep(ctx, () => ctx.reply("🔎 <b>Verifying your payment…</b>", { parse_mode: "HTML" }));
+      const r = await verifyBinanceByTxnId(orderId, txn, ctx.user.id);
+      if (r.ok) {
+        ctx.session.binanceOrderId = undefined;
+        ctx.session.payRetries = undefined;
+        // Verified: card, prompt, paste and "verifying" all go at once — the
+        // delivery and this confirmation are all that is left.
+        return flowEnd(ctx, () => ctx.reply(
+          [
+            "✅ <b>Payment verified!</b>",
+            `🧾 Order ID: <code>${escapeHtml(txn)}</code>`,
+            "",
+            "🚀 Your order has been <b>delivered</b> — check the message above.",
+            "💾 It is also saved in 📦 My Orders.",
+          ].join("\n"),
+          {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("📦 View my orders", cb("ord", "list", 1))
+              .text("🛍 Buy more", cb("shp", "home", 1)),
+          },
+        ));
+      }
+      if (r.reason === "ORDER_NOT_PENDING") {
+        // Either it was already confirmed (auto-poll beat the paste) or the
+        // checkout closed. Neither needs an approve card; say which, and stop
+        // treating the next messages as transaction IDs.
+        ctx.session.binanceOrderId = undefined;
+        ctx.session.payRetries = undefined;
+        const st = (await getAdminOrder(orderId).catch(() => null))?.status ?? "";
+        if (["PAID", "COMPLETED", "PENDING_FULFILLMENT", "AWAITING_STOCK"].includes(st)) {
+          return flowEnd(ctx, () => ctx.reply("✅ <b>This payment is already confirmed</b> — your order is delivered (or on its way). Find it in 📦 My Orders.", {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home"),
+          }));
+        }
+        await createTicket(ctx.user.id, "PAYMENT_ISSUE", `Binance Order ID ${txn} pasted for order ${orderId}, which is ${st || "closed"} (not awaiting payment). Check and credit the wallet if it was paid.`).catch(() => undefined);
+        return flowEnd(ctx, () => ctx.reply(
+          "⌛ <b>That checkout had already closed.</b> If you did pay, don't worry — we've opened a support ticket with your Order ID and our team will credit it to your wallet after checking.",
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🛒 Cart", cb("crt", "view")).text("🏠 Menu", "mnu:home") },
+        ));
+      }
+      // Not auto-verified → send admins an instant approve/reject card (fallback: ticket).
+      const notified = await notifyAdminsForApproval(ctx, orderId, "Binance", txn);
+      if (notified === 0) {
+        await createTicket(
+          ctx.user.id,
+          "PAYMENT_ISSUE",
+          `Binance payment — order ${orderId}, Order ID: ${txn} (auto-verify: ${r.ok ? "ok" : r.reason}).`,
+        ).catch(() => undefined);
+      }
+      const note =
+        r.reason === "AMOUNT_MISMATCH"
+          ? "⚠️ That transaction’s amount doesn’t match your order. "
+          : r.reason === "ALREADY_USED"
+            ? "⚠️ That transaction was already used. "
+            : r.reason === "WRONG_USER"
+              ? "⚠️ That order doesn’t belong to your account. "
+              : "";
+      // Re-arm only a couple of times. Leaving this state sticky turned every
+      // later chat message into a fresh "approve & deliver" card for admins.
+      const tries = (ctx.session.payRetries ?? 0) + 1;
+      ctx.session.payRetries = tries;
+      if (tries < 3) ctx.session.awaiting = "binance_txnid";
+      else ctx.session.binanceOrderId = undefined;
+      const pendingText = [
+        note ? `${note}` : "⏳ <b>We couldn't auto-verify that yet.</b>",
+        `🧾 Order ID: <code>${escapeHtml(txn)}</code>`,
+        "",
+        "🧑‍💼 Our team has been notified and will verify and deliver shortly — you'll get a message here the moment it's confirmed.",
+        "",
+        ...(tries < 3 ? ["💡 Double-checked your receipt? Paste the correct Order ID here and we'll try again instantly."] : []),
+      ].join("\n");
+      const pendingOpts = { parse_mode: "HTML" as const, reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home") };
+      // While they may still paste again the card (amount + Pay ID) stays; on
+      // the last try the whole conversation collapses to this one notice.
+      const pending = tries < 3
+        ? await flowStep(ctx, () => ctx.reply(pendingText, pendingOpts))
+        : await flowEnd(ctx, () => ctx.reply(pendingText, pendingOpts));
+      // Once the payment IS confirmed this line is only in the way.
+      if (ctx.chat) await rememberChatClutter(ctx.chat.id, pending.message_id);
+      return pending;
+    }
+    if (awaiting === "buy_qty") {
+      const variantId = ctx.session.buyVariantId ?? "";
+      const maxQty = ctx.session.buyMaxQty ?? 99;
+      if (!variantId) return ctx.reply("That item expired — open the product again.");
+      // A word instead of a number ("hi", a product name) used to become
+      // quantity 1 and REPLACE the cart. Ask again instead.
+      if (!/\d/.test(ctx.message.text)) {
+        ctx.session.awaiting = "buy_qty";
+        return ctx.reply("🔢 Please send just a number — how many would you like? (e.g. <b>2</b>)", {
+          parse_mode: "HTML",
+          reply_markup: new InlineKeyboard().text("✖️ Cancel", "mnu:home"),
+        });
+      }
+      ctx.session.buyVariantId = undefined;
+      ctx.session.buyMaxQty = undefined;
+      // It sold out while they were typing. The clamp below would otherwise pin
+      // the quantity to 0 and put a zero-quantity line into the cart.
+      if (maxQty < 1) return ctx.reply("❌ That just went out of stock — nothing has been added to your cart.");
+      let qty = Number.parseInt(ctx.message.text.replace(/[^0-9]/g, ""), 10);
+      if (!Number.isFinite(qty) || qty < 1) qty = 1;
+      let note = "";
+      if (maxQty < 1_000_000 && qty > maxQty) { qty = maxQty; note = `Only ${maxQty} available — setting quantity to ${maxQty}. `; }
+      if (qty > 99) qty = 99;
+      try {
+        await clearCart(ctx.user.id);
+        await addToCart(ctx.user.id, variantId, qty);
+        if (note) await ctx.reply(note);
+        return render(ctx, await views.checkoutSummaryView(ctx.user), false);
+      } catch (e) {
+        return ctx.reply(isCoreError(e) ? (ERROR_COPY[e.code] ?? "Could not start checkout.") : "Could not start checkout.");
+      }
+    }
+    if (awaiting === "upi_ref") {
+      const orderId = ctx.session.upiOrderId ?? "";
+      const ref = ctx.message.text.trim().slice(0, 64);
+      if (!orderId) return ctx.reply("That checkout expired — please start again from your 🛒 Cart.");
+      // Everything in this back-and-forth — the prompts, the retries, the
+      // customer's own pasted UTR, the receipt — belongs to THIS order and is
+      // clutter the moment it resolves. Recording each one lets whatever
+      // finishes the order (delivery, cancellation, expiry) sweep them away.
+      const trackPay = async (msg?: { message_id: number } | null): Promise<void> => {
+        if (msg && ctx.chat) await rememberPaymentPrompt(orderId, ctx.chat.id, msg.message_id).catch(() => undefined);
+      };
+      await trackPay(ctx.message);
+      flowRemember(ctx, ctx.message);
+      // A UPI UTR/RRN is exactly 12 digits. The old check took any 6+ characters.
+      const digits = ref.replace(/\D/g, "");
+      if (digits.length !== 12) {
+        ctx.session.awaiting = "upi_ref"; // keep waiting instead of dropping the order
+        // One in, one out: the retry replaces the previous prompt and the
+        // bad paste; the QR card stays so they can still pay.
+        const retry = await flowStep(ctx, () => ctx.reply(
+          "🔎 That doesn't look like a <b>UTR</b>. Open your UPI app → the payment → copy the <b>12-digit</b> UTR / RRN / Transaction ID and paste it here.",
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("⚠️ I have paid — need help", "ord:upipaid") },
+        ));
+        await trackPay(retry);
+        return retry;
+      }
+
+      // Visible progress while the checks run, like a card terminal. It takes
+      // the place of the prompt and the pasted UTR straight away.
+      const progress = await flowStep(ctx, () => ctx.reply("🔄 <b>Verifying your payment…</b>\n<code>▰▱▱▱▱</code>", { parse_mode: "HTML" }));
+      await trackPay(progress);
+      const step = async (bar: string, text: string): Promise<void> => {
+        await ctx.api.editMessageText(progress.chat.id, progress.message_id, `${text}\n<code>${bar}</code>`, { parse_mode: "HTML" })
+          .catch(() => undefined);
+      };
+      await step("▰▰▱▱▱", "🔄 <b>Checking the reference…</b>");
+
+      // Bind the UTR to this order. @unique means one payment settles exactly
+      // one order — a reference cannot be pasted into a second one.
+      const claim = await claimUpiUtrForOrder(orderId, digits);
+      if (!claim.ok) {
+        if (claim.reason === "ALREADY_USED") {
+          // The order is still payable: keep the QR, keep listening for the
+          // UTR of the right payment, and let the verdict replace the progress.
+          ctx.session.awaiting = "upi_ref";
+          return flowStep(ctx, () => ctx.reply(
+            "⚠️ That UTR has already been used for another payment.\n\nEach UPI payment can settle one order only. Paste the UTR from <b>this</b> payment, or open 🎫 Support if you think this is wrong.",
+            { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🎫 Support", "mnu:home") },
+          ));
+        }
+        ctx.session.awaiting = undefined;
+        ctx.session.upiOrderId = undefined;
+        ctx.session.upiQrMsgId = undefined;
+        return flowEnd(ctx, () => ctx.reply(
+          "⚠️ This order is no longer awaiting payment. Check 📦 My orders, or open 🎫 Support.",
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🎫 Support", "mnu:home") },
+        ));
+      }
+      await step("▰▰▰▰▱", "🔄 <b>Confirming with our team…</b>");
+
+      ctx.session.upiOrderId = undefined;
+      // The payment is in; the QR is now stale whichever way this resolves.
+      // (flowEnd below removes it; this keeps the id from going stale.)
+      ctx.session.upiQrMsgId = undefined;
+
+      // Auto-delivery, when the operator has enabled it and this order sits
+      // inside the risk limits. Nothing here proves the money landed — BharatPe
+      // exposes no API to ask — so the bounds are what keep it honest.
+      const decision = await shouldAutoDeliverUpi(orderId, digits);
+      if (decision.auto) {
+        await step("▰▰▰▰▰", "✅ <b>Verified — delivering…</b>");
+        try {
+          await confirmManualPayment(orderId);
+          await enqueueAdminAlert(`⚡ UPI auto-delivered ${orderId} — UTR ${digits}. Check BharatPe; if this payment never arrives, revoke and ban.`).catch(() => undefined);
+          return flowEnd(ctx, () => ctx.reply(
+            `✅ <b>Payment verified — your order is on its way!</b>\n🔢 UTR: <code>${escapeHtml(digits)}</code>\n\nCheck 📦 My orders for the delivery.`,
+            { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home") },
+          ));
+        } catch {
+          // Delivery failed after the claim — fall through to a human rather
+          // than leaving the customer with a claimed UTR and nothing to show.
+        }
+      }
+      const notified = await notifyAdminsForApproval(ctx, orderId, "UPI", digits);
+      await step("▰▰▰▰▰", "✅ <b>Reference accepted</b>");
+      const ref2 = digits;
+      if (notified === 0) await createTicket(ctx.user.id, "PAYMENT_ISSUE", `UPI payment for order ${orderId}, UTR: ${ref2}.`).catch(() => undefined);
+      // Submitted to the team: QR, prompts, paste and progress all go; the
+      // receipt is the one line left, and delivery clears even that.
+      const receipt = await flowEnd(ctx, () => ctx.reply(
+        [
+          "🧾 <b>Thanks — UTR received!</b>",
+          "",
+          `🔢 <code>${escapeHtml(ref2)}</code>`,
+          "",
+          "🧑‍💼 Our team is verifying your payment now. Your order is delivered here as soon as it clears. 🙏",
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home") },
+      ));
+      await trackPay(receipt);
+      return receipt;
+    }
+    // The ONE wallet-deposit conversation. There used to be a second one —
+    // "send an amount first, then the Order ID" (wallet_topup_amount →
+    // wal:topuptxn → wallet_topup_txn) — but nothing ever armed it, so its
+    // button always answered "that top-up request has expired". 💳 Wallet says
+    // "deposit any amount", which is exactly this flow; the amount-first island
+    // contradicted that screen and has been removed.
+    if (awaiting === "wallet_crypto_amount") {
+      flowRemember(ctx, ctx.message);
+      const val = Number.parseFloat(ctx.message.text.replace(/[^0-9.]/g, ""));
+      if (!Number.isFinite(val) || val <= 0) {
+        ctx.session.awaiting = "wallet_crypto_amount";
+        return flowStep(ctx, () => ctx.reply(`Please send a valid amount in ${ctx.user.currency}, e.g. <code>10</code>`, { parse_mode: "HTML" }));
+      }
+      ctx.session.cryptoTopupMinor = Math.round(val * 100);
+      const v = await views.cryptoNetworkView(ctx.user, { kind: "topup", amountMinor: ctx.session.cryptoTopupMinor });
+      return flowStep(ctx, () => ctx.reply(v.text, { parse_mode: "HTML", reply_markup: v.kb }));
+    }
+    if (awaiting === "wallet_free_txn") {
+      const txn = ctx.message.text.trim().slice(0, 128);
+      flowRemember(ctx, ctx.message);
+      await flowStep(ctx, () => ctx.reply("🔎 <b>Verifying your deposit…</b>", { parse_mode: "HTML" }));
+      const r = await creditFreeTopup(ctx.user.id, txn);
+      if (r.ok) {
+        return flowEnd(ctx, () => ctx.reply(
+          `✅ Deposited ${fmt(r.amountMinor, r.currency)} to your wallet! New balance: <b>${fmt(r.newBalanceMinor, r.currency)}</b>.\n🧾 Order ID: <code>${escapeHtml(txn)}</code>`,
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")).text("🛍 Shop", cb("shp", "home", 1)) },
+        ));
+      }
+      const msg: Record<string, string> = {
+        NOT_FOUND: "❌ That Order ID wasn't found in Binance Pay history.",
+        ALREADY_USED: "❌ That Order ID was already used.",
+        NO_API: "⚠️ Auto-verify is off — we've logged it and support will credit you.",
+        AMOUNT_MISMATCH: "❌ Could not read the amount.",
+        NOT_PENDING: "❌ Could not process.",
+        WRONG_USER: "❌ That deposit isn't yours.",
+        TOO_OLD: "❌ That payment was made before you opened the deposit screen, so it can't be used as a deposit. If you paid just now, open 💳 Wallet → Binance again and paste the Order ID of the NEW transfer — or open 🎫 Support.",
+        DAILY_LIMIT: "⏳ Daily deposit-claim limit reached — please try again tomorrow or open 🎫 Support.",
+      };
+      await createTicket(ctx.user.id, "PAYMENT_ISSUE", `Wallet deposit — Order ID ${txn} (${r.ok ? "ok" : r.reason}).`).catch(() => undefined);
+      // The deposit card stays (they may need the UID again); the verdict
+      // replaces the paste and the progress line.
+      ctx.session.awaiting = r.reason === "NOT_FOUND" || r.reason === "AMOUNT_MISMATCH" ? "wallet_free_txn" : undefined;
+      return flowStep(ctx, () => ctx.reply(
+        `${msg[r.reason] ?? "❌ Could not verify — support will check."}${ctx.session.awaiting ? "\n\n💡 Paste the correct Order ID to try again." : ""}`,
+        { reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")).text("🏠 Menu", "mnu:home") },
+      ));
+    }
+    if (awaiting === "reseller_price") {
+      const pid = ctx.session.priceProductId ?? "";
+      ctx.session.priceProductId = undefined;
+      if (!pid) { await ctx.reply("Lost track of that product — open 🏷 My Selling Price again."); return; }
+      const raw = ctx.message.text.trim();
+      if (/^off$/i.test(raw)) {
+        await setResellerPrice(ctx.user.id, pid, null, ctx.user.currency as Currency);
+        await ctx.reply("🏷 Custom price removed — your API now returns our price.");
+        return render(ctx, await views.resellerPricesView(ctx.user), false);
+      }
+      const val = Number.parseFloat(raw.replace(/[^0-9.]/g, ""));
+      if (!Number.isFinite(val) || val <= 0) {
+        ctx.session.priceProductId = pid;
+        ctx.session.awaiting = "reseller_price";
+        return ctx.reply("Send a number, e.g. <code>1.20</code>, or <code>off</code> to clear it.", { parse_mode: "HTML" });
+      }
+      await setResellerPrice(ctx.user.id, pid, Math.round(val * 100), ctx.user.currency as Currency);
+      await ctx.reply(`🏷 Saved. Your API will return <b>${val.toFixed(2)}</b> for this product.`, { parse_mode: "HTML" });
+      return render(ctx, await views.resellerPricesView(ctx.user), false);
+    }
+
+    
+    if (awaiting === "search") {
+      const q = ctx.message.text.trim().slice(0, 64);
+      ctx.session.lastSearch = q;
+      return render(ctx, await views.searchResultsView(ctx.user, q, 1), false);
+    }
+    if (awaiting === "coupon_code") {
+      const code = ctx.message.text.trim().slice(0, 32);
+      const res = await applyCouponToCart(ctx.user.id, code, ctx.user.currency as Currency);
+      if (res.ok) await ctx.reply(`✅ Coupon <b>${escapeHtml(res.code ?? code)}</b> applied — you save <b>${fmt(res.discountMinor ?? 0, ctx.user.currency)}</b>! 🎉`, { parse_mode: "HTML" });
+      else await ctx.reply(`❌ ${couponReason(res.reason ?? "INVALID")}`);
+      return render(ctx, await views.checkoutSummaryView(ctx.user), false);
+    }
+    if (awaiting === "track_order") {
+      return ctx.reply(await trackText(ctx.user.id, ctx.message.text.trim().toUpperCase()), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home") });
+    }
+    if (awaiting === "wallet_gift_amount") {
+      flowRemember(ctx, ctx.message);
+      const val = Number.parseFloat(ctx.message.text.replace(/[^0-9.]/g, ""));
+      if (!Number.isFinite(val) || val <= 0) {
+        ctx.session.awaiting = "wallet_gift_amount";
+        return flowStep(ctx, () => ctx.reply(`Please send a valid amount in ${ctx.user.currency}, e.g. <code>5</code>`, { parse_mode: "HTML" }));
+      }
+      try {
+        const g = await createWalletGift(ctx.user.id, Math.round(val * 100), ctx.me.username);
+        const share = `https://t.me/share/url?url=${encodeURIComponent(g.deepLink)}&text=${encodeURIComponent(`🎁 I sent you ${fmt(g.amountMinor, g.currency)} on ${config.STORE_NAME}! Tap to claim.`)}`;
+        return flowEnd(ctx, () => ctx.reply(
+          [
+            "🎁 <b>Gift created!</b>",
+            "",
+            `Amount: <b>${fmt(g.amountMinor, g.currency)}</b> (taken from your wallet)`,
+            `Code: <code>${g.code}</code>`,
+            `Link: ${g.deepLink}`,
+            "",
+            `Send the link or the code to your friend — they tap it and the balance lands in their wallet. Unclaimed after 30 days → refunded to you.`,
+          ].join("\n"),
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().url("📤 Share with a friend", share).row().copyText("📋 Copy code", g.code).row().text("💳 Wallet", cb("wal", "view")) },
+        ));
+      } catch (e) {
+        return flowEnd(ctx, () => ctx.reply(isCoreError(e) && e.code === "INSUFFICIENT_BALANCE" ? "💳 Not enough balance for that gift — top up first or choose a smaller amount." : `⚠️ ${isCoreError(e) ? e.message : "Could not create the gift."}`, { reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")) }));
+      }
+    }
+    if (awaiting === "gift_code") {
+      flowRemember(ctx, ctx.message);
+      const r = await claimGift(ctx.user.id, ctx.message.text);
+      return flowEnd(ctx, () => ctx.reply(giftClaimText(r), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")).text("🛍 Shop", cb("shp", "home", 1)) }));
+    }
+    if (awaiting === "ticket") {
+      const body = ctx.message.text.trim().slice(0, 2000);
+      // Quick answers first: if the FAQ covers it, offer that before a ticket.
+      const hits = await matchFaq(body, 3).catch(() => []);
+      if (hits.length > 0 && !ctx.session.ticketFaqShown) {
+        ctx.session.ticketFaqShown = true;
+        ctx.session.ticketDraft = body;
+        const kb = new InlineKeyboard();
+        for (const h of hits) kb.text(`💡 ${h.q.slice(0, 48)}`, cb("faq", "q", h.id)).row();
+        kb.text("🎫 No, open the ticket", cb("sup", "newgo")).row();
+        return ctx.reply("These might answer it right away — or open the ticket anyway:", { reply_markup: kb });
+      }
+      ctx.session.ticketFaqShown = undefined;
+      const ticket = await createTicket(ctx.user.id, "OTHER", body);
+      return ctx.reply(`🎫 Ticket <b>#${ticket.ticketNumber}</b> created. Support will reply here.`, {
+        parse_mode: "HTML",
+      });
+    }
+    if (awaiting === "support_chat") {
+      const msg = ctx.message.text.trim().slice(0, 2000);
+      const who = ctx.user.telegramHandle ? `@${ctx.user.telegramHandle}` : (ctx.user.firstName ?? String(ctx.from?.id ?? ""));
+      const safe = msg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      await enqueueAdminAlert(
+        `💬 <b>Support chat</b> — from ${escapeHtml(who)} (id <code>${ctx.from?.id}</code>):\n${safe}`,
+        [{ text: "↩️ Reply", callbackData: `adm:dm:${ctx.user.id}` }],
+      );
+      ctx.session.awaiting = "support_chat"; // stay in chat
+      return ctx.reply("✅ Sent to our team — we'll reply here shortly. (🔚 tap End chat to exit)", {
+        reply_markup: new InlineKeyboard().text("🔚 End chat", "sup:endchat"),
+      });
+    }
+    // Don't pop the menu on random text — only /start, /menu or buttons open it.
+    return ctx.reply("Tap /menu 🏠 to open the menu, or use /shop to browse.");
+  });
+
+  // ── Callback router (Bot UX doc §1: every callback answered < 1 s) ──
+  // ── Instant feel ──
+  // A button's spinner stays until the callback is answered, and most handlers
+  // answered only after their database work. Now: if a handler has not
+  // answered within 250 ms the spinner is cleared for it; a later answer with
+  // an ALERT is shown as a short self-deleting note instead of being lost
+  // (plain toasts are simply dropped). Anything still running after 0.7 s gets
+  // Telegram's "typing…" indicator, so the customer always sees motion.
+  bot.use(async (ctx, next) => {
+    if (!ctx.chat) return next();
+    const typing = setTimeout(() => { void ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => undefined); }, 700);
+    if (!ctx.callbackQuery) {
+      try { return await next(); } finally { clearTimeout(typing); }
+    }
+    let answered = false;
+    const original = ctx.answerCallbackQuery.bind(ctx);
+    const patched = async (other?: Parameters<typeof original>[0]): Promise<true> => {
+      if (!answered) { answered = true; return original(other); }
+      const opt = typeof other === "string" ? { text: other, show_alert: false } : (other ?? {});
+      if (opt.text && opt.show_alert && ctx.chat) {
+        const note = await ctx.reply(opt.text).catch(() => undefined);
+        if (note) setTimeout(() => { void ctx.api.deleteMessage(ctx.chat!.id, note.message_id).catch(() => undefined); }, 8000);
+      } else if (opt.text && ctx.chat && !/^[⏳🔎⚡]/u.test(opt.text) && !/(?:…|\.\.\.)\s*$/.test(opt.text)) {
+        // A late plain toast ("✅ Added to cart", "Copied") was dropped silently
+        // once the auto-answer had fired; show it briefly instead. Progress
+        // hints (⏳…) are skipped — the result itself follows right away.
+        const note = await ctx.reply(opt.text).catch(() => undefined);
+        if (note) setTimeout(() => { void ctx.api.deleteMessage(ctx.chat!.id, note.message_id).catch(() => undefined); }, 4000);
+      }
+      return true;
+    };
+    (ctx as unknown as { answerCallbackQuery: typeof patched }).answerCallbackQuery = patched;
+    const early = setTimeout(() => { if (!answered) { answered = true; void original().catch(() => undefined); } }, 250);
+    try {
+      await next();
+    } finally {
+      clearTimeout(early);
+      clearTimeout(typing);
+      if (!answered) { answered = true; await original().catch(() => undefined); }
+    }
+  });
+
+  bot.on("callback_query:data", async (ctx) => {
+    const parsed = parseCb(ctx.callbackQuery.data);
+    if (!parsed) {
+      await ctx.answerCallbackQuery({ text: "Menu expired — use /start" });
+      return;
+    }
+    const { ns, action, args } = parsed;
+    const route = `${ns}:${action}`;
+    const user = ctx.user;
+
+    // Leaving a prompt by tapping a menu button abandons it. Otherwise the
+    // next thing typed (a search, a message to support) was still read as the
+    // old answer — a quantity that replaced the cart, a coupon, a ticket.
+    // Payment-reference prompts stay armed: people often check the menu
+    // before pasting their UTR / Order ID.
+    const aw = ctx.session.awaiting;
+    // "Add stock" mode stays open for several pastes/files, but ANY other tap
+    // ends it — otherwise a search typed later would be saved as a sellable key.
+    if (aw === "admin_addkeys" && !["adm:kv", "adm:kvdone", "adm:stockyes", "adm:stockno"].includes(route)) {
+      ctx.session.awaiting = null;
+      ctx.session.admVariantId = undefined;
+    }
+    if (aw && (ns === "mnu" || ns === "shp" || ns === "crt" || route === "ord:list")
+      && !aw.startsWith("admin_") && !aw.startsWith("sale_")
+      && !["binance_txnid", "upi_ref", "wallet_inr_utr", "wallet_free_txn", "support_chat"].includes(aw)) {
+      ctx.session.awaiting = null;
+    }
+
+    // Prevent double-submits on payment actions (rapid taps / concurrent webhooks).
+    const isPay = route.startsWith("ord:pay") || route === "ord:cryptonet";
+    if (isPay) {
+      // Updates are serialized per user, so the lock below is free again by the
+      // time a rapid second tap runs — it then created a SECOND order/address
+      // and silently closed the first. Remember the tapped message briefly too.
+      const tapMsg = ctx.callbackQuery?.message?.message_id;
+      if (tapMsg) {
+        const fresh = await getRedis().set(`paytap:${user.id}:${tapMsg}:${route}`, "1", "EX", 8, "NX").catch(() => "OK");
+        if (!fresh) { await ctx.answerCallbackQuery({ text: "⏳ Already processing your order…" }).catch(() => undefined); return; }
+      }
+      const locked = await getRedis().set(`paylock:${user.id}`, "1", "EX", 60, "NX");
+      if (!locked) { await ctx.answerCallbackQuery({ text: "⏳ Already processing your order…" }); return; }
+      await ctx.editMessageReplyMarkup().catch(() => undefined); // remove buttons so it can't be tapped again
+    }
+
+    // New-account first-order cap, enforced on every rail (the checkout screen
+    // already hides the buttons; this covers stale buttons and deep links).
+    if (isPay || route === "ord:crypto" || route === "ord:cryptonet") {
+      // Same numbers the checkout screen used: combo synced, coupon deducted.
+      await syncComboDiscount(user.id, user.currency as Currency).catch(() => undefined);
+      const cartNow = await getCartView(user.id, user.currency as Currency).catch(() => null);
+      const disc = cartNow ? ((await getCartCoupon(user.id, user.currency as Currency).catch(() => null))?.discountMinor ?? 0) : 0;
+      const cap = cartNow ? await firstOrderAllowed(user.id, Math.max(0, cartNow.subtotalMinor - disc), user.currency as Currency).catch(() => ({ ok: true as const })) : { ok: true as const };
+      if (!cap.ok) {
+        if (isPay) await getRedis().del(`paylock:${user.id}`).catch(() => undefined);
+        await ctx.answerCallbackQuery({
+          text: cap.reason === "daily_limit"
+            ? `Daily limit: up to ${cap.maxPerDay} orders per 24 hours. Please try again later.`
+            : `New accounts can order up to $${cap.maxUsd} for the first ${cap.hoursLeft}h. Please start with a smaller order.`,
+          show_alert: true,
+        }).catch(() => undefined);
+        await render(ctx, await views.checkoutSummaryView(user), false).catch(() => undefined);
+        return;
+      }
+    }
+
+    try {
+      if (ns === "adm") {
+        await handleAdminCallback(ctx, action, args);
+        return;
+      }
+      switch (route) {
+        case "mnu:home":
+          await render(ctx, await views.menuView(user), true);
+          break;
+        // From a payment card: keep the card (amount, Pay ID, QR) on screen.
+        case "mnu:homenew":
+          await render(ctx, await views.menuView(user), false);
+          break;
+        case "mnu:help":
+          await render(ctx, await views.helpView(), true);
+          break;
+        case "mnu:noop":
+          break;
+        case "mnu:search":
+          ctx.session.awaiting = "search";
+          await ctx.reply("🔍 Type the product name you're looking for:");
+          break;
+
+        case "shp:home":
+          await render(ctx, await views.shopHomeView(user, intArg(args, 0, 1)), true);
+          break;
+        case "shp:soldout":
+          await render(ctx, await views.soldOutView(user, intArg(args, 0, 1)), true);
+          break;
+        case "shp:root":
+          await render(ctx, await views.categoriesView(null), true);
+          break;
+        case "shp:sub":
+          await render(ctx, await views.categoriesView(args[0] ?? null), true);
+          break;
+        case "shp:cat":
+          await render(ctx, await views.productListView(user, args[0] ?? "", intArg(args, 1, 1)), true);
+          break;
+        case "shp:prod":
+          ctx.session.buyProductId = args[0] ?? "";
+          await render(ctx, await views.productView(user, args[0] ?? ""), true);
+          break;
+
+        // Shop by category — the brand-tile grid.
+        case "cat:home":
+          await ctx.answerCallbackQuery().catch(() => undefined);
+          await render(ctx, await views.categoryGridView(user), true);
+          break;
+        case "cat:open":
+          await ctx.answerCallbackQuery().catch(() => undefined);
+          await render(ctx, await views.categoryProductsView(user, args[0] ?? "", intArg(args, 1, 1)), true);
+          break;
+
+        case "shp:find":
+          await ctx.answerCallbackQuery();
+          ctx.session.awaiting = "search";
+          await ctx.reply("🔍 <b>Search products</b>\n\nSend a product name or keyword (e.g. <code>netflix</code>, <code>office</code>):", { parse_mode: "HTML" });
+          break;
+        case "src:pg": {
+          const q = ctx.session.lastSearch ?? "";
+          await render(ctx, await views.searchResultsView(user, q, intArg(args, 0, 1)), true);
+          break;
+        }
+
+        case "crt:add":
+          await addToCart(user.id, args[0] ?? "");
+          await ctx.answerCallbackQuery({ text: "✅ Added to cart" });
+          await render(ctx, await views.cartViewKb(user), true);
+          break;
+        case "crt:buynow": {
+          await ctx.answerCallbackQuery();
+          const vId = args[0] ?? "";
+          const stock = await getVariantAvailable(vId);
+          await render(ctx, views.quantityPickerView(vId, stock, ctx.session.buyProductId), true);
+          break;
+        }
+        case "crt:qty": {
+          const vId = args[0] ?? "";
+          const stock = await getVariantAvailable(vId);
+          // The picker always offers at least "1", so a variant that sold out
+          // between rendering and tapping got clamped to 0 and a zero-quantity
+          // line went into the cart.
+          if (stock < 1) {
+            await ctx.answerCallbackQuery({ text: "❌ That just went out of stock.", show_alert: true });
+            break;
+          }
+          let qty = intArg(args, 1, 1);
+          if (qty < 1) qty = 1;
+          if (stock < 1_000_000 && qty > stock) qty = stock;
+          if (qty > 99) qty = 99; // same ceiling the typed-quantity path enforces
+          await clearCart(user.id);
+          await addToCart(user.id, vId, qty);
+          await ctx.answerCallbackQuery({ text: `Quantity: ${qty}` });
+          await render(ctx, await views.checkoutSummaryView(user), true);
+          break;
+        }
+        case "crt:qtycustom": {
+          const vId = args[0] ?? "";
+          ctx.session.buyVariantId = vId;
+          ctx.session.buyMaxQty = await getVariantAvailable(vId);
+          ctx.session.awaiting = "buy_qty";
+          await ctx.answerCallbackQuery();
+          const cap = ctx.session.buyMaxQty >= 1_000_000 ? "" : ` (max ${ctx.session.buyMaxQty})`;
+          await ctx.reply(`🔢 Send the quantity you want${cap}:`);
+          break;
+        }
+        case "crt:view":
+          await render(ctx, await views.cartViewKb(user), true);
+          break;
+        case "crt:inc":
+          await changeQty(user.id, args[0] ?? "", 1);
+          await render(ctx, await views.cartViewKb(user), true);
+          break;
+        case "crt:dec":
+          await changeQty(user.id, args[0] ?? "", -1);
+          await render(ctx, await views.cartViewKb(user), true);
+          break;
+        case "crt:del":
+          await removeItem(user.id, args[0] ?? "");
+          await render(ctx, await views.cartViewKb(user), true);
+          break;
+        case "crt:clear":
+          await clearCart(user.id);
+          await render(ctx, await views.cartViewKb(user), true);
+          break;
+        case "crt:checkout":
+          await render(ctx, await views.checkoutSummaryView(user), true);
+          break;
+        case "crt:coupon":
+          await ctx.answerCallbackQuery();
+          ctx.session.awaiting = "coupon_code";
+          await ctx.reply("🎟 Send your <b>coupon code</b> to apply a discount:", { parse_mode: "HTML" });
+          break;
+        case "crt:couponrm":
+          await removeCouponFromCart(user.id);
+          await ctx.answerCallbackQuery({ text: "Coupon removed" });
+          await render(ctx, await views.checkoutSummaryView(user), true);
+          break;
+
+        // Wallet pay is a two-step: confirm what will be charged, THEN charge.
+        case "ord:paywallet": {
+          await ctx.answerCallbackQuery();
+          // The coupon has to be in here: checkoutWithWallet charges
+          // subtotal − discount, so a confirm screen built on the bare subtotal
+          // quoted a price higher than the one actually taken — and disagreed
+          // with the Checkout screen the customer had just tapped.
+          const [cv, w, cvCoupon] = await Promise.all([
+            getCartView(user.id, user.currency as Currency),
+            getWallet(user.id),
+            getCartCoupon(user.id, user.currency as Currency),
+          ]);
+          if (cv.lines.length === 0) { await ctx.reply(ERROR_COPY.CART_EMPTY ?? "🛒 Your cart is empty."); break; }
+          const walletCur = w.currency as Currency;
+          const cvDiscount = cvCoupon?.discountMinor ?? 0;
+          const payable = Math.max(0, cv.subtotalMinor - cvDiscount);
+          const charge = walletCur === (user.currency as Currency) ? payable : convertMinor(payable, user.currency as Currency, walletCur);
+          const after = Number(w.balanceMinor) - charge;
+          await ctx.reply(
+            [
+              "🧾 <b>Confirm your purchase</b>",
+              "",
+              // Capped: one line per cart line can run past Telegram's 4096-char
+              // limit, and the whole confirm screen would then fail to send.
+              ...cv.lines.slice(0, 20).map((l) => `📦 ${escapeHtml(l.productName)}${l.quantity > 1 ? ` ×${l.quantity}` : ""} — ${l.lineTotalMinor === null ? "—" : fmt(l.lineTotalMinor, cv.currency)}`),
+              cv.lines.length > 20 ? `<i>…and ${cv.lines.length - 20} more item(s)</i>` : "",
+              "",
+              cvCoupon ? `🎟 Coupon <b>${escapeHtml(cvCoupon.code)}</b>: −${fmt(cvDiscount, cv.currency)}` : "",
+              `💳 <b>Total: ${fmt(payable, cv.currency)}</b>`,
+              walletCur !== (user.currency as Currency) ? `🔁 Charged from wallet: <b>${fmt(charge, walletCur)}</b>` : "",
+              "",
+              `💰 Wallet now: <b>${fmt(w.balanceMinor, walletCur)}</b>`,
+              `💰 After payment: <b>${fmt(Math.max(0, after), walletCur)}</b>`,
+              "",
+              after < 0 ? "⚠️ Not enough balance — top up first." : "⚡ Your item is delivered here the moment you confirm.",
+            ].filter((l) => l !== "").join("\n"),
+            {
+              parse_mode: "HTML",
+              reply_markup: after < 0
+                ? new InlineKeyboard().text("➕ Add balance", cb("wal", "crypto")).row().text("✖️ Cancel", cb("crt", "view"))
+                : new InlineKeyboard()
+                    .add(sbtn(`✅ Confirm & pay ${fmt(charge, walletCur)}`, cb("ord", "paywalletok", String(charge)), "success")).row()
+                    .text("✖️ Cancel", cb("crt", "view")),
+            },
+          );
+          break;
+        }
+        case "ord:paywalletok": {
+          await ctx.answerCallbackQuery({ text: "⏳ Processing…" });
+          // Never take more than the confirm screen quoted: the cart can change
+          // in the Mini App (or a price can move) between the two taps. A little
+          // slack covers rounding between the quote and the wallet-currency price.
+          const quoted = Number(args[0]);
+          const maxTotalMinor = Number.isFinite(quoted) && quoted > 0 ? Math.ceil(quoted * 1.01) + 1 : undefined;
+          let result: Awaited<ReturnType<typeof checkoutWithWallet>>;
+          try {
+            // The animation runs while the order is processed, not before it.
+            result = await withPurchaseAnimation(ctx, () => checkoutWithWallet(user.id, "DIRECT", maxTotalMinor !== undefined ? { maxTotalMinor } : {}));
+          } catch (e) {
+            if (isCoreError(e) && e.message === "PRICE_CHANGED") {
+              await ctx.reply("🔄 <b>Your total changed</b> since the confirm screen (cart or price update). Nothing was charged — please review and confirm again.", {
+                parse_mode: "HTML",
+                reply_markup: new InlineKeyboard().text("🧾 Review again", cb("ord", "paywallet")).text("🛒 Cart", cb("crt", "view")),
+              });
+              break;
+            }
+            throw e;
+          }
+          await ctx.reply(
+            successCard("Order Success", [
+              `✅ Payment confirmed`,
+              `📦 Order <b>${result.orderNumber}</b>`,
+              `💰 Amount ${fmt(result.totalMinor, result.currency)}`,
+              `🙏 Thank you so much, ${greetName(user)} — it is an honour to serve you!`,
+            ]),
+            { parse_mode: "HTML" },
+          );
+          await deliverAll(ctx, result.deliveries, result.orderNumber);
+          // Served — the pre-purchase greeting and any "we're checking" notices
+          // have done their job.
+          if (ctx.chat) await clearChatClutter(ctx.chat.id);
+          if (result.pendingManualItems > 0) {
+            await ctx.reply(
+              `⏳ <b>${result.pendingManualItems} item(s) being prepared</b>\nThey arrive in this chat automatically — usually within a minute. Nothing more to do.`,
+              { parse_mode: "HTML" },
+            );
+          }
+          // Discovery: after paying, show tier progress and offer the spin.
+          try {
+            const [ts, scfg] = await Promise.all([tierOf(user.id), getSpinConfig()]);
+            const rowKb = new InlineKeyboard();
+            rowKb.text("🏆 My Tier", cb("prf", "tier"));
+            if (scfg.enabled) rowKb.text("🎡 Spin & Win", cb("spn", "ord", result.orderId));
+            await ctx.reply(
+              [
+                `🏆 <b>${ts.tier.name} member</b> — ${escapeHtml(ts.tier.perk)}`,
+                ts.next
+                  ? `📈 Spend <b>${fmt(ts.toNextMinor, ts.currency)}</b> more to reach <b>${ts.next.name}</b>`
+                  : "👑 You're at the top tier — thank you!",
+                scfg.enabled ? "\n🎡 <b>You earned a spin!</b> Tap below to try your luck." : "",
+              ].filter(Boolean).join("\n"),
+              { parse_mode: "HTML", reply_markup: rowKb },
+            );
+          } catch { /* never block a delivery over this */ }
+          // One tidy closing message: instructions + referral, not three separate ones.
+          const closing = [
+            await deliveryInstructionsMessage(),
+            // Referral pitch only on the day's first delivery, not every order.
+            (await shouldSendReferralNudge(user.id)) ? referralNudgeMessage(user.referralCode, ctx.me.username) : null,
+          ].filter(Boolean).join("\n\n");
+          if (closing) {
+            await ctx.reply(closing, {
+              parse_mode: "HTML",
+              reply_markup: new InlineKeyboard()
+                .text("⚡ Buy again", cb("ord", "again", result.orderId)).text("📦 My orders", cb("ord", "list", 1)).row()
+                .text("🛍 Shop more", cb("shp", "home", 1)).text("🏠 Menu", "mnu:home"),
+            }).catch(() => undefined);
+          }
+          break;
+        }
+        // Pay Later is credit — confirm the debt before it is taken on.
+        case "ord:paybnpl": {
+          await ctx.answerCallbackQuery();
+          const [cvb, bn, bCoupon] = await Promise.all([
+            getCartView(user.id, user.currency as Currency),
+            getBnplStatus(user.id),
+            getCartCoupon(user.id, user.currency as Currency),
+          ]);
+          if (cvb.lines.length === 0) { await ctx.reply(ERROR_COPY.CART_EMPTY ?? "🛒 Your cart is empty."); break; }
+          const bCur = bn.currency as Currency;
+          // checkoutWithBnpl takes on subtotal − discount, so the coupon belongs
+          // on the confirm screen too — otherwise the debt quoted here is higher
+          // than the debt actually created.
+          const bDiscount = bCoupon?.discountMinor ?? 0;
+          const bPayable = Math.max(0, cvb.subtotalMinor - bDiscount);
+          const bCharge = bCur === (user.currency as Currency) ? bPayable : convertMinor(bPayable, user.currency as Currency, bCur);
+          const owedAfter = bn.outstandingMinor + bCharge;
+          const leftAfter = bn.availableMinor - bCharge;
+          await ctx.reply(
+            [
+              "🕐 <b>Confirm Pay Later</b>",
+              "",
+              // Capped for the same reason as the wallet confirm screen: past
+              // ~4096 characters Telegram rejects the whole message.
+              ...cvb.lines.slice(0, 20).map((l) => `📦 ${escapeHtml(l.productName)}${l.quantity > 1 ? ` ×${l.quantity}` : ""} — ${l.lineTotalMinor === null ? "—" : fmt(l.lineTotalMinor, cvb.currency)}`),
+              cvb.lines.length > 20 ? `<i>…and ${cvb.lines.length - 20} more item(s)</i>` : "",
+              "",
+              bCoupon ? `🎟 Coupon <b>${escapeHtml(bCoupon.code)}</b>: −${fmt(bDiscount, cvb.currency)}` : "",
+              `💳 <b>Total: ${fmt(bPayable, cvb.currency)}</b>`,
+              bCur !== (user.currency as Currency) ? `🔁 Added to your credit: <b>${fmt(bCharge, bCur)}</b>` : "",
+              "",
+              `🕐 You already owe: <b>${fmt(bn.outstandingMinor, bCur)}</b>`,
+              `🧾 <b>You will owe: ${fmt(owedAfter, bCur)}</b>`,
+              `📉 Credit left after: <b>${fmt(Math.max(0, leftAfter), bCur)}</b>`,
+              "",
+              leftAfter < 0
+                ? "⚠️ This exceeds your Pay Later limit — pay from your wallet instead, or repay some of what you owe."
+                : "ℹ️ You are taking this on credit. Repay from 💳 Wallet → Repay to free the limit up again.",
+            ].filter((l) => l !== "").join("\n"),
+            {
+              parse_mode: "HTML",
+              reply_markup: leftAfter < 0
+                ? new InlineKeyboard().text("💰 Pay from wallet", cb("ord", "paywallet")).row().text("✖️ Cancel", cb("crt", "view"))
+                : new InlineKeyboard()
+                    .add(sbtn(`✅ Confirm — owe ${fmt(bCharge, bCur)}`, cb("ord", "paybnplok"), "primary")).row()
+                    .text("✖️ Cancel", cb("crt", "view")),
+            },
+          );
+          break;
+        }
+        case "ord:paybnplok": {
+          await ctx.answerCallbackQuery({ text: "⏳ Processing…" });
+          try {
+            const result = await withPurchaseAnimation(ctx, () => checkoutWithBnpl(user.id));
+            await ctx.reply(
+              successCard("Order Placed — Pay Later", [
+                `✅ Placed on 🕒 Pay Later (BNPL)`,
+                `📦 Order <b>${result.orderNumber}</b>`,
+                `🕒 Added to your BNPL balance: ${fmt(result.totalMinor, result.currency)}`,
+                `🙏 Thank you so much, ${greetName(user)} — repay anytime from 💰 Wallet.`,
+              ]),
+              { parse_mode: "HTML" },
+            );
+            await deliverAll(ctx, result.deliveries, result.orderNumber);
+            if (result.pendingManualItems > 0) await ctx.reply(`🔄 ${result.pendingManualItems} item(s) are being prepared — arriving here shortly.`);
+            const instr = await deliveryInstructionsMessage();
+            if (instr) {
+              await ctx.reply(instr, {
+                parse_mode: "HTML",
+                reply_markup: new InlineKeyboard()
+                  .text("⚡ Buy again", cb("ord", "again", result.orderId)).text("📦 My orders", cb("ord", "list", 1)).row()
+                  .text("🛍 Shop more", cb("shp", "home", 1)).text("🏠 Menu", "mnu:home"),
+              }).catch(() => undefined);
+            }
+          } catch (e) {
+            // Only a limit problem is a limit problem: out of stock, an empty
+            // cart or a price change used to be reported as "limit exceeded".
+            const limit = isCoreError(e) && e.code === "INSUFFICIENT_BALANCE";
+            const why = limit
+              ? "your Pay Later limit isn't enough for this order"
+              : isCoreError(e) ? (ERROR_COPY[e.code] ?? "something went wrong") : "something went wrong";
+            await ctx.reply(`❌ Couldn't place this on Pay Later — ${why}. Nothing was charged; try another payment method.`, {
+              reply_markup: new InlineKeyboard().text("🛒 Cart", cb("crt", "view")).text("🏠 Menu", "mnu:home"),
+            });
+            if (!isCoreError(e)) void logError("bnplCheckout", e, { userId: user.id });
+          }
+          break;
+        }
+        case "ord:paygw": {
+          await ctx.answerCallbackQuery({ text: "⏳ Creating payment link…" });
+          const gw = await createGatewayCheckout(user.id, args[0] ?? "");
+          const payKb = new InlineKeyboard()
+            .url(`🔗 Pay ${fmt(gw.totalMinor, gw.currency)}`, gw.url)
+            .row()
+            .text("🛒 Back to Cart", "crt:view");
+          await editCard(
+            ctx,
+            [
+              `🧾 Order <b>${gw.orderNumber}</b> created — ${fmt(gw.totalMinor, gw.currency)}.`,
+              "",
+              "Complete the payment within <b>15 minutes</b>. Delivery lands here automatically after confirmation.",
+            ].join("\n"),
+            payKb,
+          );
+          break;
+        }
+        case "ord:paystars": {
+          await ctx.answerCallbackQuery({ text: "⭐ Creating Stars invoice…" });
+          const st = await createStarsCheckout(user.id);
+          await ctx.replyWithInvoice(
+            `Order ${st.orderNumber}`,
+            `${config.STORE_NAME} — instant digital delivery`,
+            st.orderId,
+            "XTR",
+            [{ label: `Order ${st.orderNumber}`, amount: st.stars }],
+          );
+          break;
+        }
+        case "ord:paybinance": {
+          // A stale button must not open a rail the admin has switched off.
+          if (!(await binanceOffered())) {
+            await ctx.answerCallbackQuery({ text: "Binance Pay is not available right now — please use another method.", show_alert: true });
+            await render(ctx, await views.checkoutSummaryView(user), true);
+            break;
+          }
+          await ctx.answerCallbackQuery({ text: "⏳ Creating order…" });
+          // Priced in USD for this order only — the customer's currency and
+          // wallet are left exactly as they were.
+          const bz = await createBinanceManualCheckout(user.id, { useWallet: args[0] === "w", currency: "USD" });
+          ctx.session.binanceOrderId = bz.orderId;
+          ctx.session.payRetries = 0;
+          // Arm the paste right away: the next message they send is treated as the Order ID.
+          ctx.session.awaiting = "binance_txnid";
+          const bzCard = await editCard(
+            ctx,
+            [
+              `🟡 <b>Pay via Binance Pay</b>`,
+              `🧾 Order <b>${bz.orderNumber}</b>`,
+              "",
+              "┏━━━━━━━━━━━━━━━━━━━━",
+              `┃ 💵 <b>Amount</b>`,
+              `┃ <code>${bz.binanceAmount}</code> ${bz.binanceAsset}`,
+              "┃",
+              `┃ 🆔 <b>Binance Pay ID</b>`,
+              `┃ <code>${bz.binanceUid}</code>`,
+              "┗━━━━━━━━━━━━━━━━━━━━",
+              "",
+              `🧮 Order value: <b>${fmt(bz.totalMinor, bz.currency)}</b>`,
+              "",
+              "📋 Tap the buttons below to copy the amount and the Pay ID — paste them straight into Binance.",
+              "",
+              "⚠️ Send the <b>exact</b> amount. A different amount cannot be matched automatically.",
+              "",
+              "✅ <b>After paying, just paste your Binance Order ID here</b> — we verify it and deliver instantly. No extra taps needed.",
+              "",
+              "<i>The Order ID is on your Binance payment receipt.</i>",
+              "",
+              "⚠️ Problem or error? Tap <b>I have paid — need help</b> and our team takes over.",
+            ].join("\n"),
+            new InlineKeyboard()
+              .copyText(`📋 Copy amount — ${bz.binanceAmount} ${bz.binanceAsset}`, bz.binanceAmount)
+              .row()
+              .copyText(`📋 Copy Binance Pay ID — ${bz.binanceUid}`, String(bz.binanceUid))
+              .row()
+              .text("⚠️ I have paid — need help", `ord:binancehelp:${bz.orderId}`)
+              .row()
+              // Menu opens in a NEW message: editing it in place wiped the
+              // amount and Pay ID the customer still needed.
+              .text("✖️ Cancel", cb("ord", "cryptocancel", bz.orderId))
+              .text("🏠 Menu", "mnu:homenew"),
+          );
+          // Remember whatever message the card ENDED UP in, so whatever finishes
+          // the order can take it out of the chat. Remembering the tapped message
+          // was wrong whenever the card had to be re-sent (a photo product card
+          // cannot be edited into text), which left the real card on screen.
+          if (ctx.chat && bzCard) await rememberPaymentPrompt(bz.orderId, ctx.chat.id, bzCard.message_id);
+          // A fresh conversation: leftovers of an abandoned one go, this card stays.
+          await flowStart(ctx, bzCard);
+          break;
+        }
+        case "ord:binancetxn": {
+          await ctx.answerCallbackQuery();
+          if (!ctx.session.binanceOrderId) {
+            await ctx.reply("This checkout expired. Please start again from your cart.");
+            break;
+          }
+          ctx.session.awaiting = "binance_txnid";
+          await flowStep(ctx, () => ctx.reply(
+            "🔎 Paste your Binance <b>Order ID</b> (open the payment in Binance → it’s the ID on the receipt):",
+            { parse_mode: "HTML" },
+          ));
+          break;
+        }
+        case "ord:binancehelp": {
+          await ctx.answerCallbackQuery();
+          const oid = args[0] ?? ctx.session.binanceOrderId ?? "";
+          const notified = await notifyAdminsForApproval(ctx, oid, "Binance", "customer reported an issue").catch(() => 0);
+          if (notified === 0) {
+            await createTicket(user.id, "PAYMENT_ISSUE", `Binance payment issue on order ${oid} — customer tapped "need help".`).catch(() => undefined);
+          }
+          ctx.session.awaiting = "binance_txnid"; // they can still paste the ID
+          const notice = await flowStep(ctx, () => ctx.reply(
+            [
+              "🆘 <b>Our team has been notified</b>",
+              "",
+              "We're checking your payment now and will deliver here as soon as it's confirmed. 🙏",
+              "",
+              "💡 If you have the Binance <b>Order ID</b> from your receipt, paste it here — that usually verifies instantly.",
+            ].join("\n"),
+            { parse_mode: "HTML" },
+          ));
+          // Once the payment IS confirmed this notice is only in the way.
+          if (ctx.chat) await rememberChatClutter(ctx.chat.id, notice.message_id);
+          break;
+        }
+        case "ord:binancepaid": {
+          await ctx.answerCallbackQuery({ text: "Thanks! We’ll verify and deliver soon.", show_alert: true });
+          await createTicket(user.id, "PAYMENT_ISSUE", `Binance payment sent for order ${args[0] ?? ""}. Please verify UID and confirm.`).catch(() => undefined);
+          break;
+        }
+        // 📋 Copy for a delivered value too long for a native copy_text button:
+        // the value alone, in a code block (tap = copy), self-deleting.
+        case "dl:copy":
+        case "dl:copyall": {
+          const orderId = args[0] ?? "";
+          const rows = await revealOrderDeliveries(user.id, orderId).catch(() => []);
+          const values = rows.filter((r) => !r.replaced).map((r) => deliveredValue(r.payload)).filter((v) => v.length > 0);
+          if (values.length === 0) { await ctx.answerCallbackQuery({ text: "Nothing to copy for this order.", show_alert: true }); break; }
+          let picked: string[];
+          if (route === "dl:copy") {
+            const n = intArg(args, 1, 1);
+            const v = values[n - 1];
+            if (!v) { await ctx.answerCallbackQuery({ text: "That item is no longer on this order.", show_alert: true }); break; }
+            picked = [v];
+          } else {
+            picked = values;
+          }
+          await ctx.answerCallbackQuery({ text: "📋 Tap the text below to copy" });
+          if (user.telegramId !== null) {
+            const body = picked.map((v) => `<code>${escapeHtml(v)}</code>`).join("\n\n");
+            await enqueueTelegramMessage(
+              user.telegramId,
+              `${body}\n\n<i>Tap to copy · this message disappears in 10 minutes. 💾 Always in 📦 My orders.</i>`,
+              { deleteAfterSec: 600 },
+            );
+          }
+          break;
+        }
+        case "ord:list":
+          await render(ctx, await views.ordersView(user, intArg(args, 0, 1)), true);
+          break;
+        case "ord:view":
+          await render(ctx, await views.orderDetailView(user, args[0] ?? ""), true);
+          break;
+
+        case "lang:home":
+          await render(ctx, views.languageView(user), true);
+          break;
+        case "lang:set": {
+          // Callback data is attacker-controlled, so an unknown code would be
+          // written straight to the user row and then handed to every translate
+          // call downstream. Only the languages we actually ship are accepted.
+          const raw = args[0] ?? "en";
+          const loc = LOCALES.some((l) => l.code === raw) ? raw : "en";
+          await setUserLocale(user.id, loc);
+          user.locale = loc;
+          await ctx.answerCallbackQuery({ text: t(loc, "lang_done") });
+          await render(ctx, await views.menuView(user), true);
+          break;
+        }
+        case "cur:home":
+          await render(ctx, views.currencyView(user), true);
+          break;
+        case "cur:set": {
+          const cur = args[0] === "USD" ? "USD" : "INR";
+          await setUserCurrency(user.id, cur);
+          user.currency = cur;
+          await ctx.answerCallbackQuery({ text: t(user.locale, "cur_done", { cur }) });
+          await render(ctx, await views.menuView(user), true);
+          break;
+        }
+        case "ord:payupi": {
+          {
+            // Switched off, or this order is over the admin's UPI cap.
+            const cartNow = await getCartView(user.id, user.currency as Currency).catch(() => null);
+            const gate = await upiOffered(cartNow?.subtotalMinor);
+            if (!gate.ok) {
+              await ctx.answerCallbackQuery({
+                text: gate.reason === "over_limit" && gate.maxMinor
+                  ? `UPI is available for orders up to ${fmt(gate.maxMinor, "INR")}. Please pay with crypto or Binance — instant and automatic.`
+                  : "UPI is not available right now — please use another method.",
+                show_alert: true,
+              });
+              await render(ctx, await views.checkoutSummaryView(user), true);
+              break;
+            }
+          }
+          await ctx.answerCallbackQuery({ text: "⏳ Creating UPI order…" });
+          // A stale button must not silently flip a USDT customer to INR.
+          if (user.currency !== "INR") {
+            await ctx.reply(
+              "🪙 Your currency is <b>USD (USDT)</b> — please pay with <b>Binance</b> (instant), or switch to <b>INR</b> from 💱 Currency to use UPI.",
+              { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💱 Currency", cb("cur", "home")).text("🏠 Menu", "mnu:home") },
+            );
+            break;
+          }
+          let up;
+          try {
+            up = await createUpiManualCheckout(user.id, { useWallet: args[0] === "w" });
+          } catch (e) {
+            if (isCoreError(e) && e.message === "WALLET_COVERS_ORDER") throw e; // the outer handler offers the wallet button
+            const msg = isCoreError(e) ? (ERROR_COPY[e.code] ?? e.message) : "Something went wrong creating your UPI order.";
+            await ctx.reply(`⚠️ ${msg}\n\nPlease try again, or pay with 🪙 Binance.`, {
+              parse_mode: "HTML",
+              reply_markup: new InlineKeyboard().text("🛒 Back to cart", cb("crt", "view")).text("🏠 Menu", "mnu:home"),
+            });
+            break;
+          }
+          ctx.session.upiOrderId = up.orderId;
+          // Arm the UTR paste right away — no extra tap needed.
+          ctx.session.awaiting = "upi_ref";
+          // Build a UPI deep link for the EXACT amount and render it as a QR.
+          const amountRupees = (up.totalMinor / 100).toFixed(2);
+          const payee = up.payeeName || config.STORE_NAME;
+          const upiUri =
+            `upi://pay?pa=${encodeURIComponent(up.upiId)}&pn=${encodeURIComponent(payee)}` +
+            `&am=${amountRupees}&cu=INR&tn=${encodeURIComponent(up.orderNumber)}`;
+          const caption = [
+            `🇮🇳 <b>Pay via UPI</b>`,
+            `🧾 Order <b>${up.orderNumber}</b>`,
+            "",
+            ...(up.walletUsedMinor > 0
+              ? [
+                  `🧮 Order total: <b>${fmt(up.orderTotalMinor, up.currency)}</b>`,
+                  `💰 Paid from wallet: <b>−${fmt(up.walletUsedMinor, up.currency)}</b>`,
+                  "",
+                ]
+              : []),
+            "┏━━━━━━━━━━━━━━━━━━",
+            `┃ 💵 <b>Amount to pay</b>`,
+            `┃ <code>${amountRupees}</code>`,
+            "┃",
+            `┃ 🆔 <b>UPI ID</b>`,
+            `┃ <code>${up.upiId}</code>`,
+            `┃ <i>${escapeHtml(payee)}</i>`,
+            "┗━━━━━━━━━━━━━━━━━━",
+            "",
+            "📷 <b>Scan the QR</b> in any UPI app (GPay / PhonePe / Paytm) — the amount is pre-filled.",
+            "📋 No QR? Tap the buttons below to copy the amount and UPI ID.",
+            "",
+            "✅ After paying, paste the <b>12-digit UTR</b> from your receipt here.",
+            "",
+            "⏳ <b>Pay within 5 minutes</b> — after that this order closes and you'll need to start again.",
+            "🕐 UPI payments are checked <b>by our team</b>, so delivery can take a short while.",
+            "⚡ Want it instantly? Pay with <b>Binance (USDT)</b> — that verifies automatically.",
+          ].join("\n");
+          // NOTE: no url() button for the upi:// link — Telegram only accepts
+          // http/https/tg in inline URL buttons and rejects the whole message
+          // with BUTTON_URL_INVALID, which made this screen fail silently.
+          const upiKb = new InlineKeyboard()
+            .copyText(`📋 Copy amount — ₹${amountRupees}`, amountRupees)
+            .row()
+            .copyText(`📋 Copy UPI ID — ${up.upiId}`, up.upiId)
+            .row()
+            .text("⚠️ I have paid — need help", "ord:upipaid")
+            .row()
+            .text("✖️ Cancel", "ord:upicancel")
+            .text("🏠 Menu", "mnu:homenew");
+          try {
+            const png = await QRCode.toBuffer(upiUri, { width: 512, margin: 2, color: { dark: "#000000", light: "#FFFFFF" } });
+            const qrMsg = await ctx.replyWithPhoto(new InputFile(png, "upi-qr.png"), {
+              caption,
+              parse_mode: "HTML",
+              reply_markup: upiKb,
+            });
+            // Remembered so it can be cleared once the payment is in. A QR left
+            // on screen after delivery invites a second payment to the same
+            // order, and buries the delivered items under a dead screen.
+            ctx.session.upiQrMsgId = qrMsg.message_id;
+            if (ctx.chat) await rememberPaymentPrompt(up.orderId, ctx.chat.id, qrMsg.message_id);
+            await flowStart(ctx, qrMsg);
+          } catch {
+            // QR generation or photo send failed — still show the payment details.
+            // These fallbacks used to store no id at all, so their card stayed on
+            // screen for ever; they are recorded like the QR now.
+            try {
+              const m = await ctx.reply(caption, { parse_mode: "HTML", reply_markup: upiKb });
+              if (ctx.chat) await rememberPaymentPrompt(up.orderId, ctx.chat.id, m.message_id);
+              ctx.session.upiQrMsgId = m.message_id;
+              await flowStart(ctx, m);
+            } catch {
+              const m = await ctx.reply(caption.replace(/<[^>]+>/g, ""), {
+                reply_markup: new InlineKeyboard().text("⚠️ I have paid — need help", "ord:upipaid").row().text("🏠 Menu", "mnu:home"),
+              }).catch(() => undefined);
+              if (ctx.chat && m) await rememberPaymentPrompt(up.orderId, ctx.chat.id, m.message_id);
+              if (m) { ctx.session.upiQrMsgId = m.message_id; await flowStart(ctx, m); }
+            }
+          }
+          break;
+        }
+        case "ord:upicancel": {
+          await ctx.answerCallbackQuery();
+          if (ctx.session.upiQrMsgId) {
+            await ctx.api.deleteMessage(ctx.chat!.id, ctx.session.upiQrMsgId).catch(() => undefined);
+            ctx.session.upiQrMsgId = undefined;
+          }
+          const cancelledOrder = ctx.session.upiOrderId;
+          ctx.session.upiOrderId = undefined;
+          ctx.session.awaiting = undefined;
+          // Actually close it: the wallet part it holds goes back right away
+          // (it used to stay locked until the order timed out), and a late UTR
+          // can no longer settle an order the customer walked away from.
+          // Refused automatically when a UTR was already submitted.
+          if (cancelledOrder) await cancelCryptoOrder(cancelledOrder, user.id).catch(() => false);
+          // The payment card and the whole UTR conversation are dead weight now.
+          if (cancelledOrder) await clearPaymentPrompts(cancelledOrder).catch(() => undefined);
+          await flowEnd(ctx, () => ctx.reply(comeBackMessage(user), {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("🛍 Pick it up again", cb("shp", "home", 1)).row()
+              .text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home"),
+          }));
+          break;
+        }
+        case "ord:crypto": {
+          await ctx.answerCallbackQuery();
+          {
+            const cartNow = await getCartView(user.id, user.currency as Currency).catch(() => null);
+            await render(ctx, await views.cryptoNetworkView(user, { kind: "order", useWallet: args[0] === "w", payableMinor: cartNow?.subtotalMinor }), true);
+          }
+          break;
+        }
+        case "ord:cryptonet": {
+          const code = args[0] ?? "";
+          const useWallet = args[1] === "w";
+          const net = cryptoNetwork(code);
+          if (!net) { await ctx.answerCallbackQuery({ text: "Unknown network", show_alert: true }); break; }
+          await ctx.answerCallbackQuery({ text: `⏳ Creating your ${net.asset} address…` });
+          let co;
+          try {
+            co = await createCryptoCheckout(user.id, { network: net.code, useWallet });
+          } catch (e) {
+            if (isCoreError(e) && e.message === "WALLET_COVERS_ORDER") throw e; // handled below: offers the wallet button
+            const msg = isCoreError(e) ? (ERROR_COPY[e.code] ?? e.message) : "Could not create the crypto payment.";
+            await ctx.reply(`⚠️ ${escapeHtml(msg)}`, {
+              parse_mode: "HTML",
+              reply_markup: new InlineKeyboard().text("🌐 Other network", cb("ord", "crypto", ...(useWallet ? ["w"] : []))).text("🛒 Cart", cb("crt", "view")),
+            });
+            break;
+          }
+          ctx.session.awaiting = undefined;
+          // The picker it was tapped from is done with.
+          await ctx.deleteMessage().catch(() => undefined);
+          const card = await sendCryptoCard(ctx, co, co.networkInfo);
+          if (ctx.chat && card) await rememberPaymentPrompt(co.refId, ctx.chat.id, card.message_id);
+          await flowStart(ctx, card);
+          break;
+        }
+        case "ord:cryptochk": {
+          const oid = args[0] ?? "";
+          try {
+            const r = await checkCryptoPayment("order", oid, user.id);
+            if (r.settled || r.status === "finished") {
+              await ctx.answerCallbackQuery({ text: "✅ Payment confirmed!" });
+              await flowEnd(ctx, () => ctx.reply(
+                "✅ <b>Payment confirmed — your order is on its way!</b>\n\nThe delivery lands here within moments; it is also saved in 📦 My orders.",
+                { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🛍 Buy more", cb("shp", "home", 1)) },
+              ));
+            } else {
+              await ctx.answerCallbackQuery({ text: cryptoStatusLine(r).replace(/<[^>]+>/g, "").slice(0, 190), show_alert: r.status !== "waiting" });
+            }
+          } catch (e) {
+            await ctx.answerCallbackQuery({ text: isCoreError(e) ? e.message : "Could not check right now — try again in a minute.", show_alert: true });
+          }
+          break;
+        }
+        case "ord:cryptocancel": {
+          await ctx.answerCallbackQuery();
+          const oid = args[0] ?? "";
+          const cancelled = await cancelCryptoOrder(oid, user.id).catch(() => false);
+          if (!cancelled) {
+            // Already paid, already closed, or a reference was submitted — say so
+            // rather than showing "cancelled" for an order that is still alive.
+            const st = (await getAdminOrder(oid).catch(() => null))?.status ?? "";
+            if (st === "PENDING_PAYMENT") {
+              await ctx.reply("🧾 Your payment reference was already submitted, so this order stays open while our team checks it. You'll get a message here once it's confirmed.", {
+                reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:homenew"),
+              });
+              break;
+            }
+            if (["PAID", "COMPLETED", "PENDING_FULFILLMENT", "AWAITING_STOCK"].includes(st)) {
+              await ctx.reply("✅ This order is already paid — it can't be cancelled. Find it in 📦 My Orders.", {
+                reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)),
+              });
+              break;
+            }
+          }
+          if (ctx.session.binanceOrderId === oid) { ctx.session.binanceOrderId = undefined; ctx.session.payRetries = undefined; }
+          ctx.session.awaiting = undefined;
+          await flowEnd(ctx, () => ctx.reply(comeBackMessage(user), {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("🛍 Pick it up again", cb("shp", "home", 1)).row()
+              .text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home"),
+          }));
+          break;
+        }
+        case "ord:upipaid": {
+          await ctx.answerCallbackQuery();
+          const payOrderId = ctx.session.upiOrderId;
+          if (!payOrderId) { await ctx.reply("This checkout expired. Please start again from your cart."); break; }
+          ctx.session.awaiting = "upi_ref";
+          const ask = await flowStep(ctx, () => ctx.reply("🔎 Paste your UPI <b>reference / UTR number</b>:", { parse_mode: "HTML" }));
+          if (ctx.chat) await rememberPaymentPrompt(payOrderId, ctx.chat.id, ask.message_id).catch(() => undefined);
+          break;
+        }
+        case "lic:list":
+          await render(ctx, await views.vaultView(user, intArg(args, 0, 1)), true);
+          break;
+        // Standalone 2FA/OTP generator — paste any secret, get the live code.
+        case "otp:tool": {
+          await ctx.answerCallbackQuery();
+          await render(ctx, views.otpToolView(otpSecretOf(ctx), ctx.session.otpReveal === true), true);
+          break;
+        }
+        case "otp:ask": {
+          ctx.session.awaiting = "otp_secret";
+          await ctx.answerCallbackQuery();
+          await ctx.reply(
+            [
+              "🔐 <b>Send your 2FA secret key</b>",
+              "",
+              "Paste the Base32 setup key — the one an app would scan as a QR code.",
+              "Spaces and lower case are fine; I'll tidy it up.",
+              "",
+              "<i>🔒 I delete your message straight after reading it, and the secret is never written to our database or any log. It is held encrypted for this session only so I can refresh the code — 🗑 Clear removes it immediately.</i>",
+            ].join("\n"),
+            { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Cancel", cb("otp", "tool")) },
+          );
+          break;
+        }
+        case "otp:gen": {
+          const secret = otpSecretOf(ctx);
+          const t = secret ? generateTotp(secret) : null;
+          if (!t) {
+            await ctx.answerCallbackQuery({ text: "That secret is not valid — send it again", show_alert: true });
+            break;
+          }
+          await ctx.answerCallbackQuery({ text: `Code ${t.code} · ${t.secondsLeft}s left` });
+          await render(ctx, views.otpToolView(secret, ctx.session.otpReveal === true), true);
+          break;
+        }
+        case "otp:eye": {
+          ctx.session.otpReveal = !(ctx.session.otpReveal === true);
+          await ctx.answerCallbackQuery();
+          await render(ctx, views.otpToolView(otpSecretOf(ctx), ctx.session.otpReveal === true), true);
+          break;
+        }
+        case "otp:clr": {
+          // Wipe it from the session — the only place it ever lived.
+          ctx.session.otpSecret = undefined;
+          ctx.session.otpReveal = undefined;
+          await ctx.answerCallbackQuery({ text: "Cleared" });
+          await render(ctx, views.otpToolView(null, false), true);
+          break;
+        }
+        case "otp:get": {
+          await ctx.answerCallbackQuery();
+          try {
+            const rv = await revealDelivery(user.id, args[0] ?? "");
+            const fixed = repairAccountPair(rv.payload.username, rv.payload.password);
+            const secret = (fixed?.twofa ?? (rv.payload as { twofa?: string }).twofa ?? "").trim();
+            const t = secret ? generateTotp(secret) : null;
+            if (!t) {
+              await ctx.reply("⚠️ No valid 2FA secret is stored for this item. Open a 🎫 Support ticket and we'll sort it.");
+              break;
+            }
+            await ctx.reply(
+              [
+                "🔢 <b>Your login code</b>",
+                "",
+                `<code>${t.code}</code>`,
+                "",
+                `⏳ Valid for <b>${t.secondsLeft}s</b>${t.secondsLeft <= 8 ? ` — expiring soon, next code: <code>${t.nextCode}</code>` : ""}`,
+                "",
+                "<i>Tap the code to copy it. Codes change every 30 seconds — tap again for a fresh one.</i>",
+              ].join("\n"),
+              {
+                parse_mode: "HTML",
+                reply_markup: new InlineKeyboard()
+                  .copyText(`📋 Copy ${t.code}`, t.code).row()
+                  .text("🔄 New code", cb("otp", "get", args[0] ?? "")),
+              },
+            );
+          } catch {
+            await ctx.reply("⚠️ Couldn't read that item. Open it from 📦 My orders and try again.");
+          }
+          break;
+        }
+        case "lic:view": {
+          const oiId = args[0] ?? "";
+          const revealed = await revealDelivery(user.id, oiId);
+          await sendRevealed(ctx, oiId, revealed.productName, revealed.variantName, revealed.payload);
+          break;
+        }
+        case "ord:reveal": {
+          await ctx.answerCallbackQuery({ text: "Fetching your keys…" });
+          const all = await revealOrderDeliveries(user.id, args[0] ?? "");
+          // Mark superseded units. For orders over 10 items this is the only way
+          // the customer sees their keys, so a retired one must never be handed
+          // back silently among the live ones.
+          const ds = all.map((r) => ({
+            orderItemId: r.orderItemId ?? "",
+            productName: r.replaced ? `${r.productName} — ⚠️ REPLACED, no longer works` : r.productName,
+            variantName: r.variantName,
+            kind: (r.payload.kind === "DIGITAL_ACCOUNT" ? "DIGITAL_ACCOUNT" : "LICENSE_KEY") as "LICENSE_KEY" | "DIGITAL_ACCOUNT",
+            secret: { key: r.payload.key, username: r.payload.username, password: r.payload.password, ...(r.payload.twofa ? { twofa: r.payload.twofa } : {}), expiresAt: r.payload.expiresAt },
+            activationGuide: null,
+          }));
+          if (ds.length === 0) { await ctx.reply("No delivered keys found for this order."); break; }
+          const deadCount = all.filter((r) => r.replaced).length;
+          if (deadCount > 0) {
+            await ctx.reply(
+              `ℹ️ <b>${deadCount} of these was replaced.</b> The old value is kept for your records but no longer works — it's marked <b>REPLACED</b> below, and the working one came in your replacement order.`,
+              { parse_mode: "HTML" },
+            );
+          }
+          await deliverAll(ctx, ds, args[0] ?? "");
+          break;
+        }
+
+        case "ord:txt":
+        case "ord:txtp": {
+          // Same data as "Get all keys", handed over as a file. `txtp` is the
+          // plain copy with no "1) 2) 3)" prefixes, for pasting into a password
+          // manager or a script.
+          const numbered = route === "ord:txt";
+          await ctx.answerCallbackQuery({ text: "Building your file…" });
+          const orderId = args[0] ?? "";
+          const rows = await revealOrderDeliveries(user.id, orderId);
+          if (rows.length === 0) { await ctx.reply("No delivered keys found for this order."); break; }
+          const meta = await getOrderSummary(user.id, orderId).catch(() => null);
+          const lines = rows.map((r) => ({
+            productName: r.replaced ? `${r.productName} (REPLACED - no longer works)` : r.productName,
+            variantName: r.variantName,
+            payload: { kind: r.payload.kind, key: r.payload.key, username: r.payload.username, password: r.payload.password, twofa: r.payload.twofa, expiresAt: r.payload.expiresAt },
+            activationGuide: null,
+          }));
+          const body = buildDeliveryTxt(lines, meta?.orderNumber ?? orderId, {
+            numbered,
+            ...(meta ? { amountLabel: fmt(meta.totalMinor, meta.currency) } : {}),
+          });
+          const name = `order-${(meta?.orderNumber ?? orderId).replace(/[^A-Za-z0-9_-]/g, "")}${numbered ? "" : "-plain"}.txt`;
+          await ctx.replyWithDocument(new InputFile(Buffer.from(body, "utf8"), name), {
+            caption: `📄 ${rows.length} item(s)${numbered ? "" : " — no numbering"}. Keep this file safe.`,
+            reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home"),
+          }).catch(async () => {
+            await ctx.reply("Couldn't build that file — tap 📄 Get all keys instead.").catch(() => undefined);
+          });
+          break;
+        }
+
+        case "wal:view":
+          await render(ctx, await views.walletView(user), true);
+          break;
+        case "wal:hist":
+          await render(ctx, await views.walletHistoryView(user, intArg(args, 0, 1)), true);
+          break;
+        case "wal:topup": {
+          await ctx.answerCallbackQuery();
+          const uid = config.BINANCE_PAY_UID;
+          if (!uid || !(await binanceOffered())) {
+            await ctx.reply("Binance deposits are not available right now — use 🌐 Deposit crypto or UPI from your 💳 Wallet.", {
+              reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")),
+            });
+            break;
+          }
+          const upiDep = user.currency === "INR" && (await upiOffered()).ok;
+          const depositCard = await ctx.reply(
+            [
+              "💳 <b>Add funds to your Wallet — Binance (USDT)</b>",
+              "━━━━━━━━━━━━━━━━━━━━",
+              "Deposit <b>any amount</b> — it is credited to your wallet automatically after we verify your Order ID.",
+              "",
+              "<b>Step 1.</b> Open the <b>Binance</b> app → <b>Pay</b> → <b>Send</b>.",
+              "<b>Step 2.</b> Send USDT to our Binance UID:",
+              `        👉 <code>${uid}</code>  (tap to copy)`,
+              "<b>Step 3.</b> Enter the amount you want to deposit and confirm the transfer.",
+              "<b>Step 4.</b> Open the completed payment in Binance and copy its <b>Order ID</b> (the long number in the transaction details).",
+              "<b>Step 5.</b> Come back here, tap the button below, and paste the <b>Order ID</b>.",
+              "",
+              "✅ We read the exact USDT amount you sent and credit your wallet instantly.",
+              "⚠️ Send only <b>USDT</b>. Each Order ID can be used once.",
+            ].join("\n"),
+            {
+              parse_mode: "HTML",
+              reply_markup: new InlineKeyboard()
+                .copyText(`📋 Copy Binance Pay ID — ${uid}`, String(uid)).row()
+                .text("✅ I have deposited — enter Order ID", "wal:freetxn").row()
+                .add(...(upiDep ? [{ text: "🇮🇳 Add INR via UPI (🕐 manual approval)", callback_data: "wal:topupinr" }] : [])).row()
+                .text("🏠 Menu", "mnu:home"),
+            },
+          );
+          // The deposit card is the anchor of this conversation until the
+          // Order ID is verified.
+          await flowStart(ctx, depositCard);
+          // Only transfers made from now on can be claimed as a deposit.
+          await noteFreeTopupIntent(user.id).catch(() => undefined);
+          break;
+        }
+        case "wal:bnplrepay": {
+          await ctx.answerCallbackQuery({ text: "Processing…" });
+          try {
+            const r = await repayBnpl(user.id);
+            if (r.repaidMinor > 0) await ctx.reply(`✅ Repaid <b>${fmt(r.repaidMinor, r.currency)}</b> from your wallet. Remaining BNPL: <b>${fmt(r.outstandingMinor, r.currency)}</b>.`, { parse_mode: "HTML" });
+            else await ctx.reply("Nothing to repay, or your wallet balance is 0. Top up first.");
+          } catch { await ctx.reply("Couldn't repay — add wallet funds first."); }
+          await render(ctx, await views.walletView(user), false);
+          break;
+        }
+        case "wal:topupinr": {
+          await ctx.answerCallbackQuery();
+          if (!config.UPI_ID || !(await upiOffered()).ok) { await ctx.reply("UPI deposits aren't available right now — use 🌐 Deposit crypto from your 💳 Wallet."); break; }
+          if (user.currency !== "INR") {
+            await ctx.reply(
+              "🪙 Your wallet currency is <b>USD (USDT)</b>, so deposits go through <b>Binance</b> — it is instant and automatic.\n\nSwitch your currency to <b>INR</b> from 💱 Currency if you want to pay by UPI.",
+              { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💱 Currency", cb("cur", "home")).text("🏠 Menu", "mnu:home") },
+            );
+            break;
+          }
+          ctx.session.awaiting = "wallet_inr_amount";
+          const askAmt = await ctx.reply(
+            "🇮🇳 <b>Add INR to your wallet</b>\n\nHow much do you want to add? Send the amount in ₹ (e.g. <code>500</code>).\n\n<i>Your wallet is held in USD and credited at the store rate.</i>",
+            { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Cancel", "wal:view") },
+          );
+          await flowStart(ctx, askAmt, { card: false });
+          break;
+        }
+        case "wal:crypto": {
+          await ctx.answerCallbackQuery();
+          ctx.session.awaiting = "wallet_crypto_amount";
+          const ask = await ctx.reply(
+            `💳 <b>Add funds to your wallet</b>\n\nHow much do you want to add? Send the amount in <b>${user.currency}</b> (e.g. <code>10</code>).\n\n<i>Next you pick how to pay — USDT on BEP20 / TRC20 / Solana, LTC, TON, Binance Pay or UPI.</i>`,
+            { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Cancel", "wal:view") },
+          );
+          await flowStart(ctx, ask, { card: false });
+          break;
+        }
+        case "wal:cryptonet": {
+          const code = args[0] ?? "";
+          const net = cryptoNetwork(code);
+          const amount = ctx.session.cryptoTopupMinor ?? 0;
+          if (!net) { await ctx.answerCallbackQuery({ text: "Unknown network", show_alert: true }); break; }
+          if (amount <= 0) { await ctx.answerCallbackQuery({ text: "That deposit expired — tap Deposit crypto again.", show_alert: true }); break; }
+          await ctx.answerCallbackQuery({ text: `⏳ Creating your ${net.asset} address…` });
+          let tp;
+          try {
+            tp = await createCryptoTopup(user.id, amount, net.code);
+          } catch (e) {
+            const msg = isCoreError(e) ? (ERROR_COPY[e.code] ?? e.message) : "Could not create the deposit.";
+            await ctx.reply(`⚠️ ${escapeHtml(msg)}`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")) });
+            break;
+          }
+          ctx.session.cryptoTopupMinor = undefined;
+          await ctx.deleteMessage().catch(() => undefined);
+          const card = await sendCryptoCard(ctx, tp, tp.networkInfo);
+          // Cleared when the credit lands (creditCryptoTopup → clearChatClutter).
+          if (ctx.chat && card) await rememberChatClutter(ctx.chat.id, card.message_id);
+          // Also keyed to the top-up, so the paths that clear by reference
+          // (own-terminal credit, expiry) take the card away too.
+          if (ctx.chat && card) await rememberPaymentPrompt(tp.refId, ctx.chat.id, card.message_id).catch(() => undefined);
+          await flowStart(ctx, card);
+          break;
+        }
+        case "wal:cryptochk": {
+          const tid = args[0] ?? "";
+          try {
+            const r = await checkCryptoPayment("topup", tid, user.id);
+            if (r.settled) {
+              await ctx.answerCallbackQuery({ text: "✅ Credited!" });
+              await flowEnd(ctx, () => ctx.reply("✅ <b>Deposit credited to your wallet!</b>", {
+                parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")).text("🛍 Shop", cb("shp", "home", 1)),
+              }));
+            } else {
+              await ctx.answerCallbackQuery({ text: cryptoStatusLine(r).replace(/<[^>]+>/g, "").slice(0, 190), show_alert: r.status !== "waiting" });
+            }
+          } catch (e) {
+            await ctx.answerCallbackQuery({ text: isCoreError(e) ? e.message : "Could not check right now — try again in a minute.", show_alert: true });
+          }
+          break;
+        }
+        case "wal:freetxn":
+          await ctx.answerCallbackQuery();
+          ctx.session.awaiting = "wallet_free_txn";
+          await flowStep(ctx, () => ctx.reply("🔎 Paste your Binance <b>Order ID</b> now (from the completed payment in Binance → Pay → History). We will verify it and credit your wallet instantly:", { parse_mode: "HTML" }));
+          break;
+        case "api:home":
+          await render(ctx, await views.apiKeysView(user), true);
+          break;
+        case "api:list":
+          await render(ctx, await views.apiKeysListView(user), true);
+          break;
+        case "api:fixscopes": {
+          await ctx.answerCallbackQuery({ text: "Updating…" });
+          const r = await grantAllScopesToOwner(user.id);
+          await ctx.reply(
+            [
+              `🛠 <b>Permissions updated</b> — ${r.updated} key(s).`,
+              "",
+              `Your keys now have: <code>${r.scopes.join("</code>, <code>")}</code>`,
+              "",
+              "Catalog, balance and orders endpoints will all respond now. No need to regenerate the key.",
+            ].join("\n"),
+            { parse_mode: "HTML" },
+          );
+          await render(ctx, await views.apiKeysView(user), false);
+          break;
+        }
+        case "api:prices":
+          await ctx.answerCallbackQuery();
+          await render(ctx, await views.resellerPricesView(user), true);
+          break;
+        case "api:setprice": {
+          await ctx.answerCallbackQuery();
+          ctx.session.priceProductId = args[0] ?? "";
+          ctx.session.awaiting = "reseller_price";
+          await ctx.reply(
+            "🏷 Send your selling price for this product (e.g. <code>1.20</code>).\n\nSend <code>off</code> to go back to our price.",
+            { parse_mode: "HTML" },
+          );
+          break;
+        }
+        case "api:docs":
+          await render(ctx, views.apiDocsView(), true);
+          break;
+        case "api:orders":
+          await render(ctx, await views.apiOrdersView(user), true);
+          break;
+        case "api:balance":
+          await render(ctx, await views.apiBalanceView(user), true);
+          break;
+        case "api:regen": {
+          await ctx.answerCallbackQuery();
+          const cur = await getActiveApiKeyForOwner(user.id);
+          await ctx.reply([
+            "⚠️ <b>Regenerate API Key?</b>",
+            "",
+            cur
+              ? `Your current key <code>${cur.prefix}</code> will stop working <u>immediately</u>. Any app or script using it will break until you update it with the new key.`
+              : "You don't have a key yet — this will create your first one.",
+            "",
+            "The new key will be shown <b>only once</b> — keep it safe.",
+            "",
+            "Do you want to continue?",
+          ].join("\n"), {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("✅ Yes, Regenerate", "api:regenok")
+              .text("❌ No, Keep Key", "api:home"),
+          });
+          break;
+        }
+        case "api:regenok": {
+          await ctx.answerCallbackQuery();
+          const created = await regenerateApiKeyForOwner(user.id, "my key");
+          const base = (loadConfig().PUBLIC_API_URL ?? "").replace(/\/$/, "") + "/api/v1/developer";
+          await ctx.reply([
+            "✅ <b>New API key</b> — copy it now, it won't be shown again:",
+            "",
+            `<code>${created.apiKey}</code>`,
+            "",
+            "Your previous key has been revoked and will no longer work.",
+            `Base URL: <code>${base}</code>`,
+          ].join("\n"), { parse_mode: "HTML" });
+          await render(ctx, await views.apiKeysView(user), false);
+          break;
+        }
+        case "api:new": {
+          // Generated straight away. Asking for a name was friction left over
+          // from when a user could hold several keys and needed to tell them
+          // apart; with exactly one key there is nothing to distinguish, and a
+          // developer who taps Generate wants the key, not a form.
+          await ctx.answerCallbackQuery();
+          const created = await regenerateApiKeyForOwner(user.id, "api key");
+          const base = (loadConfig().PUBLIC_API_URL ?? "").replace(/\/$/, "") + "/api/v1/developer";
+          await ctx.reply([
+            "✅ <b>Your API key</b> — copy it now, it won't be shown again:",
+            "",
+            `<code>${created.apiKey}</code>`,
+            "",
+            "Scopes: catalog:read, orders:read, orders:write, wallet:read",
+            `Base URL: <code>${base}</code>`,
+            "",
+            "<i>You have one key. Tap 🔄 Regenerate Key any time — the old one stops working immediately.</i>",
+          ].join("\n"), { parse_mode: "HTML" });
+          await render(ctx, await views.apiKeysView(user), false);
+          break;
+        }
+        case "api:revoke": {
+          const done = await revokeApiKeyOwned(args[0] ?? "", user.id);
+          await ctx.answerCallbackQuery({ text: done ? "Revoked" : "Not found" });
+          await render(ctx, await views.apiKeysListView(user), true);
+          break;
+        }
+
+        case "rep:nopic": {
+          await ctx.answerCallbackQuery();
+          await submitReplaceOrTicket(ctx, undefined);
+          break;
+        }
+        case "rev:new": {
+          await ctx.answerCallbackQuery();
+          const oid = args[0] ?? "";
+          if (oid && (await orderAlreadyRated(oid))) {
+            await ctx.reply("🙏 You've already rated this order — thank you! One rating per order keeps them honest.");
+            break;
+          }
+          const kb = new InlineKeyboard()
+            .text("⭐️", `rev:rate:${oid}:1`).text("⭐️⭐️", `rev:rate:${oid}:2`).row()
+            .text("⭐️⭐️⭐️", `rev:rate:${oid}:3`).row()
+            .text("⭐️⭐️⭐️⭐️", `rev:rate:${oid}:4`).row()
+            .text("⭐️⭐️⭐️⭐️⭐️", `rev:rate:${oid}:5`);
+          await ctx.reply(
+            `⭐ <b>How would you rate your order, ${greetName(user)}?</b>\n\nTap the stars — it takes one second and really helps us. 🙏`,
+            { parse_mode: "HTML", reply_markup: kb },
+          );
+          break;
+        }
+        case "rev:rate": {
+          // The star picker has served its purpose the moment a star is tapped;
+          // leaving it in the chat invites a second, impossible attempt.
+          await ctx.deleteMessage().catch(() => undefined);
+          const oid = args[0] ?? "";
+          const rating = Math.min(5, Math.max(1, Number.parseInt(args[1] ?? "5", 10) || 5));
+          let saved: { id: string; alreadyRated: boolean };
+          try {
+            saved = await saveReview(user.id, rating, oid || undefined);
+          } catch (err) {
+            const m = String(err instanceof Error ? err.message : err);
+            await ctx.answerCallbackQuery({
+              text: m.includes("NOT_ELIGIBLE") ? "Only delivered orders can be rated." : "That order was not found.",
+              show_alert: true,
+            }).catch(() => undefined);
+            break;
+          }
+          ctx.session.reviewId = saved.id;
+          await ctx.answerCallbackQuery({ text: "Thank you! 🙏" });
+          const stars = "⭐️".repeat(rating);
+          const warm = rating >= 4
+            ? [
+                `🎉 <b>Thank you so much, ${greetName(user)}!</b> 💖`,
+                "",
+                `${stars}`,
+                "",
+                "Your support genuinely means a lot to us — it is customers like you that keep this store going. 🙏✨",
+                "",
+                "🛍 We'll keep the best deals coming just for you!",
+                "",
+                "<i>Your review will appear publicly once our team checks it.</i>",
+              ]
+            : [
+                `🙏 <b>Thank you for the honest feedback, ${greetName(user)}.</b>`,
+                "",
+                `${stars}`,
+                "",
+                "We're sorry it wasn't perfect — and we want to make it right.",
+                "",
+                "Tell us what went wrong below and our team will fix it personally. 💬",
+                "",
+                "If the item itself is faulty, tap <b>🔄 Request replacement</b> — it goes straight to our team.",
+              ];
+          ctx.session.awaiting = "review_comment";
+          const revKb = new InlineKeyboard().text("✍️ Add a comment", "rev:comment").row();
+          if (rating <= 2) revKb.text("🔄 Request replacement", "rep:home").row();
+          revKb.text("🛍 Shop again", cb("shp", "home", 1)).text("🏠 Menu", "mnu:home");
+          await ctx.reply(warm.join("\n"), { parse_mode: "HTML", reply_markup: revKb });
+          if (rating <= 2) {
+            await enqueueAdminAlert(`🚨 <b>Low rating ${rating}/5</b> from ${escapeHtml(greetName(user))} (id <code>${user.telegramId ?? "—"}</code>)${oid ? ` on order <code>${escapeHtml(oid.slice(-8))}</code>` : ""}. Consider reaching out or offering a replacement.`).catch(() => undefined);
+          }
+          // Admins moderate before anything is published.
+          await enqueueAdminAlert(
+            [
+              `⭐ <b>New review — awaiting approval</b>`,
+              `${stars} <b>${rating}/5</b>`,
+              `👤 ${greetName(user)}`,
+              `🆔 <code>${user.telegramId ?? "—"}</code>`,
+              oid ? `🧾 Order <code>${escapeHtml(oid.slice(-8))}</code>` : "",
+              "",
+              "<i>It is not visible to customers until you approve it.</i>",
+            ].filter(Boolean).join("\n"),
+            [
+              { text: "✅ Approve", callbackData: `adm:revok:${saved.id}`, style: "success" },
+              { text: "❌ Reject", callbackData: `adm:revno:${saved.id}`, style: "danger" },
+              { text: "💬 Reply", callbackData: `adm:revrep:${saved.id}`, style: "primary" },
+            ],
+          ).catch(() => undefined);
+          break;
+        }
+        case "rev:comment":
+          await ctx.answerCallbackQuery();
+          ctx.session.awaiting = "review_comment";
+          await ctx.reply("✍️ Send your comment — we read every one.");
+          break;
+
+        case "dls:home":
+          await render(ctx, await views.dealsView(user), true);
+          break;
+        case "wch:list":
+          await render(ctx, await views.watchlistView(user), true);
+          break;
+        case "wch:clear": {
+          const ws = await listWatches(user.id);
+          for (const w of ws) await unwatchProduct(user.id, w.productId, w.type);
+          await ctx.answerCallbackQuery({ text: "Watchlist cleared" });
+          await render(ctx, await views.watchlistView(user), true);
+          break;
+        }
+        case "lic:find":
+          await ctx.answerCallbackQuery();
+          ctx.session.awaiting = "keys_search";
+          await ctx.reply("🔑 <b>Find your keys</b>\n\nSend part of the product name (e.g. <code>netflix</code>):", { parse_mode: "HTML" });
+          break;
+        case "ord:again": {
+          await ctx.answerCallbackQuery({ text: "Adding to cart…" });
+          const lines = await reorderLines(user.id, args[0] ?? "");
+          if (lines.length === 0) {
+            await ctx.reply("⚠️ None of those items are available any more. Browse 🛍 Shop for what's in stock.");
+            break;
+          }
+          await clearCart(user.id);
+          for (const l of lines) await addToCart(user.id, l.variantId, l.quantity).catch(() => undefined);
+          await ctx.reply(
+            // A big re-order has one line per item; past ~4096 characters
+            // Telegram rejects the message and the customer sees nothing at all.
+            [`⚡ <b>Added to your cart</b>`, "",
+              ...lines.slice(0, 20).map((l) => `📦 ${escapeHtml(l.productName)}${l.quantity > 1 ? ` ×${l.quantity}` : ""}`),
+              ...(lines.length > 20 ? [`<i>…and ${lines.length - 20} more item(s)</i>`] : []),
+              "", "Ready when you are 👇"].join("\n"),
+            { parse_mode: "HTML" },
+          );
+          await render(ctx, await views.checkoutSummaryView(user), false);
+          break;
+        }
+        case "wch:onr": case "wch:onp": {
+          const kind = route === "wch:onr" ? "RESTOCK" : "PRICE_DROP";
+          const pid = args[0] ?? "";
+          let base: number | undefined;
+          if (kind === "PRICE_DROP") {
+            const pv = await getProductView(pid, user.currency as Currency, user.id, "DIRECT", user.locale).catch(() => null);
+            const priced = (pv?.variants ?? []).map((v) => v.priceMinor).filter((n): n is number => n !== null);
+            base = priced.length ? Math.min(...priced) : undefined;
+          }
+          const r = await watchProduct(user.id, pid, kind, base, user.currency as Currency);
+          await ctx.answerCallbackQuery({
+            text: r.already ? "Already on the list" : kind === "RESTOCK" ? "🔔 We'll tell you first!" : "📉 We'll tell you if it drops!",
+            show_alert: !r.already,
+          });
+          await render(ctx, await views.productView(user, pid), true);
+          break;
+        }
+        case "wch:offr": case "wch:offp": {
+          const kind = route === "wch:offr" ? "RESTOCK" : "PRICE_DROP";
+          await unwatchProduct(user.id, args[0] ?? "", kind);
+          await ctx.answerCallbackQuery({ text: "Stopped notifying" });
+          await render(ctx, await views.productView(user, args[0] ?? ""), true);
+          break;
+        }
+        case "rep:home":
+          await render(ctx, await views.replaceListView(user), true);
+          break;
+        case "rep:pick": {
+          const it = await getReplaceableItem(user.id, args[0] ?? "");
+          if (!it) { await ctx.answerCallbackQuery({ text: "Item not found" }); break; }
+          await ctx.answerCallbackQuery();
+          // Out of warranty: no replacement button at all — only the option to
+          // raise a ticket, which a human answers.
+          if (it.route === "ticket") { await render(ctx, views.replaceTicketOfferView(it), true); break; }
+          if (it.route === "blocked") { await render(ctx, views.replaceBlockedView(it), true); break; }
+          ctx.session.replaceItemId = it.orderItemId;
+          ctx.session.replaceReason = undefined;
+          ctx.session.replaceViaTicket = false;
+          ctx.session.awaiting = "replace_reason";
+          await render(ctx, views.replaceAskReasonView(it.label, false), true);
+          break;
+        }
+        // Per-order unit picker: choose exactly which delivered unit(s) to claim on.
+        case "rep:ord": {
+          const oid = args[0] ?? "";
+          if (ctx.session.replaceOrderId !== oid) { ctx.session.replaceSelected = []; ctx.session.replacePage = 1; }
+          ctx.session.replaceOrderId = oid;
+          await ctx.answerCallbackQuery();
+          await render(ctx, await views.replaceSelectView(user, oid, ctx.session.replaceSelected ?? []), true);
+          break;
+        }
+        case "rep:tog": {
+          const id = args[0] ?? "";
+          const oid = ctx.session.replaceOrderId ?? "";
+          const cur = new Set(ctx.session.replaceSelected ?? []);
+          const adding = !cur.has(id);
+          if (adding && cur.size >= 25) {
+            // Say so rather than silently dropping the tap.
+            await ctx.answerCallbackQuery({ text: "That's the maximum of 25 items in one request.", show_alert: true });
+            break;
+          }
+          if (adding) cur.add(id); else cur.delete(id);
+          ctx.session.replaceSelected = [...cur];
+          await ctx.answerCallbackQuery({ text: adding ? "Selected" : "Removed" });
+          await render(ctx, await views.replaceSelectView(user, oid, ctx.session.replaceSelected, ctx.session.replacePage ?? 1), true);
+          break;
+        }
+        case "rep:pg": {
+          const oid = args[0] ?? ctx.session.replaceOrderId ?? "";
+          ctx.session.replacePage = Math.max(1, Number.parseInt(args[1] ?? "1", 10) || 1);
+          await ctx.answerCallbackQuery();
+          await render(ctx, await views.replaceSelectView(user, oid, ctx.session.replaceSelected ?? [], ctx.session.replacePage), true);
+          break;
+        }
+        case "rep:all": {
+          const oid = args[0] ?? "";
+          const units = await listUnitsForOrder(user.id, oid);
+          const eligible = units.filter((u) => u.route === "claim" || u.route === "ticket").map((u) => u.orderItemId);
+          const cur = ctx.session.replaceSelected ?? [];
+          // Toggle: a full selection clears, anything else selects all eligible.
+          const capped = Math.min(eligible.length, 25);
+          ctx.session.replaceSelected = cur.length >= capped ? [] : eligible.slice(0, 25);
+          await ctx.answerCallbackQuery({ text: eligible.length > 25 ? "Selected the first 25 eligible items" : undefined });
+          await render(ctx, await views.replaceSelectView(user, oid, ctx.session.replaceSelected, ctx.session.replacePage ?? 1), true);
+          break;
+        }
+        case "rep:go": {
+          const sel = ctx.session.replaceSelected ?? [];
+          if (sel.length === 0) { await ctx.answerCallbackQuery({ text: "Pick at least one item first", show_alert: true }); break; }
+          ctx.session.replaceBatch = sel;
+          ctx.session.replaceItemId = undefined;
+          ctx.session.replaceViaTicket = undefined;
+          ctx.session.awaiting = "replace_reason";
+          await ctx.answerCallbackQuery();
+          await render(ctx, views.replaceBatchAskReasonView(sel.length), true);
+          break;
+        }
+        case "rep:tkt": {
+          const it = await getReplaceableItem(user.id, args[0] ?? "");
+          if (!it) { await ctx.answerCallbackQuery({ text: "Item not found" }); break; }
+          if (it.route !== "ticket") { await ctx.answerCallbackQuery({ text: "Use the replacement claim for this item", show_alert: true }); break; }
+          ctx.session.replaceItemId = it.orderItemId;
+          ctx.session.replaceReason = undefined;
+          ctx.session.replaceViaTicket = true;
+          ctx.session.awaiting = "replace_reason";
+          await ctx.answerCallbackQuery();
+          await render(ctx, views.replaceAskReasonView(it.label, true), true);
+          break;
+        }
+
+        case "tkt:open": {
+          await ctx.answerCallbackQuery();
+          await render(ctx, await views.ticketThreadView(user, args[0] ?? ""), true);
+          break;
+        }
+        case "tkt:re": {
+          const id = args[0] ?? "";
+          ctx.session.ticketId = id;
+          ctx.session.awaiting = "ticket_reply";
+          await ctx.answerCallbackQuery();
+          await ctx.reply("💬 Type your reply to support (you can attach a screenshot instead):", {
+            reply_markup: new InlineKeyboard().text("✖️ Cancel", `tkt:open:${id}`),
+          });
+          break;
+        }
+
+        case "ref:view":
+          await render(ctx, await views.referralView(user, ctx.me.username), true);
+          break;
+        case "ref:claim": {
+          // Matured rewards move now instead of on the next 10-minute tick;
+          // ones still in the anti-fraud hold stay where they are.
+          const r = await releaseMaturedReferralRewards({ referrerId: user.id, limit: 100 }).catch(() => ({ credited: 0, creditedMinor: 0, currency: null }));
+          const earnNow = await referralEarnings(user.id).catch(() => null);
+          await ctx.answerCallbackQuery({
+            text: r.credited > 0
+              ? `✅ ${fmt(r.creditedMinor, r.currency ?? user.currency)} moved to your wallet!`
+              : earnNow && earnNow.heldCount > 0
+                ? `⏳ Still on hold — unlocks in ~${Math.max(1, Math.ceil(((earnNow.nextReleaseAt?.getTime() ?? Date.now()) - Date.now()) / 3_600_000))}h, then it moves to your wallet automatically.`
+                : "Nothing waiting — everything is already in your wallet.",
+            show_alert: r.credited === 0,
+          }).catch(() => undefined);
+          await render(ctx, await views.referralView(user, ctx.me.username), true);
+          break;
+        }
+
+        case "sup:home":
+          await render(ctx, await views.supportHomeView(user), true);
+          break;
+        case "sup:new":
+          ctx.session.awaiting = "ticket";
+          ctx.session.ticketFaqShown = undefined;
+          await ctx.reply("🎫 Describe your issue in one message:");
+          break;
+        case "sup:newgo": {
+          // The FAQ hint did not help — open the ticket with the text they typed.
+          await ctx.answerCallbackQuery();
+          const draft = ctx.session.ticketDraft ?? "";
+          ctx.session.ticketDraft = undefined;
+          ctx.session.ticketFaqShown = undefined;
+          ctx.session.awaiting = undefined;
+          if (!draft) { ctx.session.awaiting = "ticket"; await ctx.reply("🎫 Describe your issue in one message:"); break; }
+          const ticket = await createTicket(user.id, "OTHER", draft);
+          await ctx.editMessageText(`🎫 Ticket <b>#${ticket.ticketNumber}</b> created. Support will reply here.`, { parse_mode: "HTML" }).catch(() => ctx.reply(`🎫 Ticket #${ticket.ticketNumber} created.`));
+          break;
+        }
+        case "faq:q": {
+          await ctx.answerCallbackQuery();
+          const v = await views.faqAnswerView(args[0] ?? "");
+          if (!v) { await ctx.reply("That answer is no longer available."); break; }
+          await render(ctx, v, true);
+          break;
+        }
+        case "hlp:home":
+          await render(ctx, await views.helpView(), true);
+          break;
+        case "rnw:go": {
+          // Renewal reminder tap: same product in a fresh cart, discount applied.
+          try {
+            const r = await startRenewal(user.id, args[0] ?? "", user.currency as Currency);
+            await ctx.answerCallbackQuery({ text: r.discountPct > 0 ? `🔁 ${r.discountPct}% renewal discount applied` : "🔁 Added to cart" });
+            await render(ctx, await views.checkoutSummaryView(user), false);
+          } catch (e) {
+            await ctx.answerCallbackQuery({ text: isCoreError(e) && e.code === "PRODUCT_NOT_FOUND" ? "That product is no longer available." : "Could not start the renewal.", show_alert: true });
+          }
+          break;
+        }
+        case "crt:addco": {
+          // "Customers also bought" ➕ — add and come straight back to checkout.
+          await addToCart(user.id, args[0] ?? "").catch(() => undefined);
+          await ctx.answerCallbackQuery({ text: "✅ Added" });
+          await render(ctx, await views.checkoutSummaryView(user), true);
+          break;
+        }
+        case "wal:gift": {
+          await ctx.answerCallbackQuery();
+          const mine = await listMyGifts(user.id, 3).catch(() => []);
+          const recent = mine.length ? `\n\n<i>Recent: ${mine.map((g) => `${g.code} (${g.status.toLowerCase()})`).join(", ")}</i>` : "";
+          ctx.session.awaiting = "wallet_gift_amount";
+          const ask = await ctx.reply(`🎁 <b>Gift wallet balance</b>\n\nHow much do you want to gift? Send the amount in <b>${user.currency}</b> (e.g. <code>5</code>). It is taken from your wallet now and refunded if not claimed within 30 days.${recent}`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Cancel", cb("wal", "view")) });
+          await flowStart(ctx, ask, { card: false });
+          break;
+        }
+        case "wal:giftredeem": {
+          await ctx.answerCallbackQuery();
+          ctx.session.awaiting = "gift_code";
+          const ask = await ctx.reply("🎟 Send the <b>gift code</b> (e.g. <code>AB3DE-F7GH2</code>):", { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("✖️ Cancel", cb("wal", "view")) });
+          await flowStart(ctx, ask, { card: false });
+          break;
+        }
+        case "sup:chat":
+          ctx.session.awaiting = "support_chat";
+          await ctx.reply(
+            "💬 <b>Live Support Chat</b>\nType your message and our team will reply here. You can keep sending messages.\nTap 🔚 End chat when you're done.",
+            { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🔚 End chat", "sup:endchat") },
+          );
+          break;
+        case "sup:endchat":
+          ctx.session.awaiting = null;
+          await ctx.answerCallbackQuery({ text: "Chat ended" });
+          await render(ctx, await views.menuView(user), false);
+          break;
+
+        case "prf:tier":
+          await render(ctx, await views.tierView(user), true);
+          break;
+        case "spn:ord": {
+          const r = await spinForOrder(user.id, args[0] ?? "");
+          if (!r.ok) {
+            await ctx.answerCallbackQuery({
+              text:
+                r.reason === "ALREADY_SPUN" ? "You already spun for this order"
+                : r.reason === "DAILY_LIMIT" ? `Daily limit reached — ${r.maxSpinsPerDay} spins a day. Try again tomorrow!`
+                : r.reason === "ON_MISSION" ? "Spins are paused while your Mission is active"
+                : r.reason === "DISABLED" ? "Not running right now"
+                : "Not eligible",
+              show_alert: true,
+            });
+            break;
+          }
+          await ctx.answerCallbackQuery({ text: "🎡 Spinning…" });
+          const cur = (r.currency ?? user.currency) as Currency;
+          await ctx.reply(
+            r.won
+              ? [
+                  "🎡✨ <b>YOU WON!</b> ✨🎡",
+                  "",
+                  `🎁 <b>${fmt(r.rewardMinor ?? 0, cur)}</b> has been added to your wallet.`,
+                  "",
+                  `💰 Spend it on your next order — you get a spin with every purchase (up to ${r.maxSpinsPerDay ?? 3} a day).`,
+                ].join("\n")
+              : [
+                  "🎡 <b>Better luck next time!</b> 🍀",
+                  "",
+                  `This spin didn't win — orders under <b>${fmt(r.minSpendMinor ?? 0, cur)}</b> aren't eligible for a prize.`,
+                  "",
+                  `🛍 Your order was <b>${fmt(r.orderValueMinor ?? 0, cur)}</b>. Spend a little more next time and your spin can win!`,
+                ].join("\n"),
+            { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💳 Wallet", cb("wal", "view")).text("🛍 Shop", cb("shp", "home", 1)) },
+          );
+          break;
+        }
+        case "spn:home":
+          await render(ctx, await views.spinView(user), true);
+          break;
+        case "msn:home":
+          await render(ctx, await views.missionView(user), true);
+          break;
+        case "msn:go": {
+          const r = await spin(user.id);
+          await ctx.answerCallbackQuery({ text: r.ok ? "🎡 Spinning…" : r.reason === "ALREADY_ACTIVE" ? "You already have a challenge" : "Not available" });
+          if (r.ok && r.challenge) {
+            await ctx.reply(
+              [
+                "🎡 <b>Your challenge is set!</b>",
+                "",
+                `🎯 Spend <b>${fmt(r.challenge.targetMinor, r.challenge.currency)}</b>`,
+                `🎁 Earn <b>${fmt(r.challenge.rewardMinor, r.challenge.currency)}</b> wallet credit`,
+                `📅 You have until ${r.challenge.expiresAt.toISOString().slice(0, 10)}`,
+                "",
+                "Only spending from now on counts. Good luck! 🍀",
+              ].join("\n"),
+              { parse_mode: "HTML" },
+            );
+          }
+          await render(ctx, await views.missionView(user), false);
+          break;
+        }
+        case "msn:claim": {
+          const r = await claimChallenge(user.id, args[0] ?? "");
+          await ctx.answerCallbackQuery({
+            text: r.ok ? "🎉 Reward added!" : r.reason === "NOT_REACHED" ? "Not there yet" : r.reason === "ALREADY_CLAIMED" ? "Already claimed" : "Expired",
+            show_alert: !r.ok,
+          });
+          await render(ctx, await views.missionView(user), false);
+          break;
+        }
+        case "prf:orders":
+          await render(ctx, await views.recentOrdersView(user), true);
+          break;
+        case "prf:view":
+          await render(ctx, await views.profileView(user), true);
+          break;
+        case "set:view":
+          await render(ctx, views.settingsView(user), true);
+          break;
+        case "set:curr": {
+          const next = user.currency === "INR" ? "USD" : "INR";
+          await setUserCurrency(user.id, next);
+          user.currency = next;
+          await ctx.answerCallbackQuery({ text: `Currency: ${next}` });
+          await render(ctx, views.settingsView(user), true);
+          break;
+        }
+
+        case "rsl:home":
+          await ctx.answerCallbackQuery({
+            text: "Reseller hub opens with the reseller phase.",
+            show_alert: true,
+          });
+          break;
+
+        default:
+          await ctx.answerCallbackQuery({ text: "Menu expired — use /start" });
+      }
+      // Ensure the spinner always stops.
+      await ctx.answerCallbackQuery().catch(() => undefined);
+    } catch (e) {
+      if (isCoreError(e) && e.message === "WALLET_COVERS_ORDER") {
+        await ctx.reply("💳 <b>Your wallet balance covers this whole order</b> — no need for another payment method. Pay from your wallet in one tap:", {
+          parse_mode: "HTML",
+          reply_markup: new InlineKeyboard().add(sbtn("💳 Pay with wallet", cb("ord", "paywallet"), "success")).row().text("🛒 Cart", cb("crt", "view")),
+        }).catch(() => undefined);
+        return;
+      }
+      const copy = isCoreError(e)
+        ? (e.code === "OUT_OF_STOCK" && e.message && e.message !== e.code ? `❌ ${e.message}` : (ERROR_COPY[e.code] ?? "Something went wrong."))
+        : "Something went wrong.";
+      // A late alert (the callback was already answered) becomes a short chat
+      // note — see the answer patch above — so it is never lost.
+      await ctx.answerCallbackQuery({ text: copy, show_alert: true }).catch(() => undefined);
+      if (!isCoreError(e)) throw e;
+    } finally {
+      if (isPay) await getRedis().del(`paylock:${user.id}`).catch(() => undefined);
+    }
+  });
+
+  bot.catch((err) => {
+    // Structured error logging; secrets never enter error paths.
+    // eslint-disable-next-line no-console
+    console.error("bot error", { update_id: err.ctx.update.update_id, error: String(err.error) });
+    // Also record it so an admin can read it in the bot (🩺 Logs).
+    void logError("bot", err.error, {
+      update: err.ctx.update.update_id ?? null,
+      from: err.ctx.from?.id ?? null,
+      data: err.ctx.callbackQuery?.data ?? null,
+    });
+  });
+
+  return bot;
+}
+
+async function sendDelivery(ctx: Ctx, d: DeliveredSecret): Promise<void> {
+  const oiId = (d as unknown as { orderItemId?: string }).orderItemId ?? "";
+  await sendRevealed(ctx, oiId, d.productName, d.variantName, { kind: d.kind, ...d.secret }, d.activationGuide, d.allowPwChange);
+}
+
+/**
+ * Deliver a whole order in ONE message (never a burst). For 1 item we keep the
+ * rich single-item card; for 2..threshold we send one combined message; for
+ * large orders (> threshold) we attach a .txt file with all the keys.
+ */
+async function deliverAll(ctx: Ctx, deliveries: DeliveredSecret[], orderNumber?: string): Promise<void> {
+  if (deliveries.length === 0) return;
+  if (deliveries.length === 1) { await sendDelivery(ctx, deliveries[0]!); return; }
+  const lines = deliveries.map((d) => ({ productName: d.productName, variantName: d.variantName, payload: { kind: d.kind, ...d.secret }, activationGuide: d.activationGuide, allowPwChange: d.allowPwChange }));
+  // Navigation goes on its own message after the content (see sendRevealed):
+  // a tap must never replace the message that holds the keys.
+  const menu = new InlineKeyboard().text("📦 View my orders", cb("ord", "list", 1)).text("🛍 Buy more", cb("shp", "home", 1)).row().text("🏠 Menu", "mnu:home");
+  const sendNav = () => ctx.reply("👆 Your items are in the message above — always saved in 📦 My Orders.", { parse_mode: "HTML", reply_markup: menu }).catch(() => undefined);
+  // A combined message for 2..threshold items can still blow Telegram's 4096-char
+  // cap (long credential blocks, activation guides). Both sends below would then
+  // be rejected and the .catch() would swallow it — a customer who has PAID gets
+  // nothing at all. Over the cap we take the file route, which already has its
+  // own chunked-text fallback.
+  const combined = deliveries.length > DELIVERY_FILE_THRESHOLD ? "" : buildCombinedDeliveryText(lines, orderNumber);
+  if (deliveries.length > DELIVERY_FILE_THRESHOLD || combined.length > 4096) {
+    const txt = buildDeliveryTxt(lines, orderNumber);
+    try {
+      const file = new InputFile(Buffer.from(txt, "utf8"), `order-${orderNumber ?? "delivery"}.txt`);
+      await ctx.replyWithDocument(file, {
+        caption: `🎉 Your order is delivered! ${num(deliveries.length)} items are in the attached file.\n💾 Also saved in 🔑 My Licenses.`,
+      });
+      await sendNav();
+      return;
+    } catch {
+      // Fallback: if the file send fails, deliver the keys as text messages (chunked under Telegram's 4096 limit).
+      const chunks: string[] = [];
+      let buf = "🎉 Your order is delivered:\n";
+      for (const l of lines) {
+        const row = `\n${l.productName}: ${l.payload.key ?? [l.payload.username, l.payload.password].filter(Boolean).join(" / ")}`;
+        if ((buf + row).length > 3800) { chunks.push(buf); buf = ""; }
+        buf += row;
+      }
+      if (buf.trim()) chunks.push(buf);
+      for (const chunk of chunks) await ctx.reply(chunk).catch(() => undefined);
+      await sendNav();
+      return;
+    }
+  }
+  await ctx.reply(combined, { parse_mode: "HTML" }).catch(async () => {
+    await ctx.reply(combined.replace(/<[^>]+>/g, "")).catch(() => undefined);
+  });
+  await sendNav();
+}
+
+async function sendRevealed(
+  ctx: Ctx,
+  orderItemId: string,
+  productName: string,
+  variantName: string,
+  payload: { kind: string; key?: string; username?: string; password?: string; twofa?: string; expiresAt?: string },
+  activationGuide?: string | null,
+  allowPwChange?: boolean,
+): Promise<void> {
+  const vn = variantName.trim().toLowerCase() === "standard" ? "" : ` · ${escapeHtml(variantName)}`;
+  const lines = [`📦 <b>${escapeHtml(productName)}</b>${vn}`, ""];
+  let shownCreds = false;
+  if (payload.key) {
+    const rows = payload.key.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+    const creds = rows.map(splitCredential);
+    if (rows.length > 0 && creds.every((c) => c !== null)) {
+      shownCreds = true;
+      rows.forEach((_, i) => {
+        const c = creds[i] as { id: string; pw: string; twofa?: string };
+        if (rows.length > 1) lines.push(`<b>━━ Account ${i + 1} ━━</b>`);
+        lines.push(`👤 <b>ID:</b>  <code>${escapeHtml(c.id)}</code>`);
+        lines.push(`🔐 <b>Password:</b>  <code>${escapeHtml(c.pw)}</code>`);
+        if (c.twofa) lines.push(`🔢 <b>2FA secret:</b>  <code>${escapeHtml(c.twofa)}</code>`);
+        if (rows.length > 1 && i < rows.length - 1) lines.push("");
+      });
+    } else if (rows.length > 1) {
+      lines.push("🔑 <b>Your keys:</b>");
+      for (const r of rows) lines.push(...(isDeliveredLink(r) ? linkLines(r) : [`<code>${escapeHtml(r)}</code>`]));
+    } else if (isDeliveredLink(rows[0] ?? payload.key)) {
+      lines.push(...linkLines((rows[0] ?? payload.key) as string));
+    } else {
+      lines.push(`🔑 <b>Key:</b> <code>${escapeHtml(payload.key)}</code>`);
+    }
+  }
+  const rc = repairAccountPair(payload.username, payload.password);
+  const rName = rc?.id ?? payload.username;
+  const rPass = rc?.pw ?? payload.password;
+  const rTwo = rc?.twofa ?? payload.twofa;
+  if (rName) lines.push(`👤 <b>ID:</b>  <code>${escapeHtml(rName)}</code>`);
+  if (rPass) lines.push(`🔐 <b>Password:</b>  <code>${escapeHtml(rPass)}</code>`);
+  if (rTwo) {
+    lines.push(`🔢 <b>2FA secret:</b>  <code>${escapeHtml(rTwo)}</code>`);
+    lines.push("", '🔐 Paste the <b>2FA secret</b> at <a href="https://2fa.live">2fa.live</a> to get your 6-digit OTP.');
+  }
+  if (rName && rPass) {
+    lines.push("", "📋 <b>Copy all credentials:</b>", `<code>${escapeHtml(rName)}|${escapeHtml(rPass)}${rTwo ? `|${escapeHtml(rTwo)}` : ""}</code>`);
+  }
+  if (shownCreds && payload.key) {
+    const rows = payload.key.split(/\r?\n/).map((r) => r.trim()).filter(Boolean);
+    if (rows.map(splitCredential).some((c) => c?.twofa)) {
+      lines.push("", '🔐 Paste the <b>2FA secret</b> at <a href="https://2fa.live">2fa.live</a> to get your 6-digit OTP.');
+    }
+    lines.push("", "📋 <b>Copy all credentials:</b>");
+    for (const r of rows) lines.push(`<code>${escapeHtml(r)}</code>`);
+  }
+  if (rName || shownCreds) {
+    lines.push("", "ℹ️ Tap any value above to copy it.");
+    lines.push(allowPwChange ? "🔓 This account is yours — you're welcome to change the password." : "🔒 Please do <b>not</b> change the account password.");
+  }
+  if (payload.expiresAt) lines.push(`⏳ Valid until: ${payload.expiresAt.slice(0, 10)}`);
+  if (activationGuide) lines.push("", `📄 ${escapeHtml(activationGuide)}`);
+  lines.push("", "💾 <b>Saved in 📦 My Orders</b> — reopen it any time.", "Problem? Open a 🎫 Support ticket.");
+  const kb = new InlineKeyboard();
+  // isCopyable(): Telegram caps copy_text at 256 chars and rejects the WHOLE
+  // message when it is exceeded, so an over-long value gets no copy button —
+  // it is in the message body, where tapping it copies anyway.
+  if (isCopyable(rName)) kb.copyText("📋 Copy ID", rName).row();
+  if (isCopyable(rPass)) kb.copyText("📋 Copy password", rPass).row();
+  if (isCopyable(rTwo)) kb.copyText("📋 Copy 2FA secret", rTwo).row();
+  if (rName && rPass) {
+    const all = `${rName}|${rPass}${rTwo ? `|${rTwo}` : ""}`;
+    if (isCopyable(all)) kb.copyText("📋 Copy ALL credentials", all).row();
+  }
+  // Navigation is NOT on the delivery message. Views replace the message they
+  // were tapped on, so "📦 My orders" under the credentials used to wipe the
+  // credentials off the screen. They ride on a separate follow-up message;
+  // the delivery itself only carries copy buttons (which never navigate).
+  const nav = new InlineKeyboard();
+  // Generate the OTP in the bot instead of sending them to 2fa.live (replies, never edits — stays here).
+  if (rTwo && looksLikeTotpSecret(rTwo)) nav.add(sbtn("🔢 Get my login code (OTP)", cb("otp", "get", orderItemId), "success")).row();
+  nav.text("📦 View my orders", cb("ord", "list", 1)).text("🛍 Buy more", cb("shp", "home", 1)).row()
+    .text("🏠 Menu", "mnu:home");
+  const body = lines.join("\n");
+  // Telegram hard-caps a message at 4096 chars, and one item can carry dozens of
+  // credential rows. Truncating would drop secrets the customer has PAID for, so
+  // the body is split on line boundaries instead; the keyboard rides the last part.
+  const parts: string[] = [];
+  let buf = "";
+  for (const line of lines) {
+    if (buf && buf.length + line.length + 1 > 3900) { parts.push(buf); buf = ""; }
+    buf = buf ? `${buf}\n${line}` : line;
+  }
+  if (buf) parts.push(buf);
+  if (parts.length === 0) parts.push(body);
+  // A delivery must never be lost to a formatting rejection: HTML → plain text
+  // → plain text with no keyboard. The customer has PAID; ugly beats missing.
+  for (let i = 0; i < parts.length; i++) {
+    const text = parts[i]!;
+    const last = i === parts.length - 1;
+    const markup = last && kb.inline_keyboard.length > 0 ? { reply_markup: kb } : {};
+    await ctx.reply(text, { parse_mode: "HTML", ...markup }).catch(async () => {
+      await ctx.reply(text.replace(/<[^>]+>/g, ""), markup).catch(async () => {
+        await ctx.reply(text.replace(/<[^>]+>/g, "")).catch(() => undefined);
+      });
+    });
+  }
+  await ctx.reply("👆 Your items are in the message above — always saved in 📦 My Orders.", { parse_mode: "HTML", reply_markup: nav }).catch(() => undefined);
+}

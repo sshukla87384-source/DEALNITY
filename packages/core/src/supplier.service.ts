@@ -1,0 +1,1639 @@
+import { loadConfig } from "@gis/config";
+import { prisma } from "@gis/database";
+import { encryptSecret, decryptSecret } from "@gis/shared";
+import { invalidate, getRedis } from "./redis.js";
+import { logWallet, logEvent } from "./logs.service.js";
+import { enqueueAdminAlert } from "./queues.js";
+import { manualFulfillItem } from "./orders/manual-pay.service.js";
+import { announceProduct, sendBroadcast } from "./broadcast.service.js";
+import { usdtRate } from "./fx.js";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+interface SupplierRow { id: string; name: string; baseUrl: string; apiKeyEnc: string; markupBp: number; active: boolean; docsConfig?: unknown }
+export interface SupplierProduct { ref: string; name: string; description: string; note: string; priceMinor: number; stock: number | null; variantRef?: string }
+
+/**
+ * Auth styles, tried one at a time.
+ *
+ * Sending the key every common way AT ONCE looks convenient and is how this
+ * used to work, but a server that reads `Authorization` first and fails to
+ * parse it answers 401 even though the `X-API-Key` it documents was right
+ * there in the same request. The supplier then looks broken and the operator
+ * has nothing to go on. So: try the styles in turn, and remember the one that
+ * worked on the supplier row (`docsConfig.authStyle`) so every later call —
+ * products, balance, order — uses it directly.
+ */
+export type AuthStyle = "x-api-key" | "bearer" | "apikey" | "x-api-token" | "query";
+
+const AUTH_STYLES: AuthStyle[] = ["x-api-key", "bearer", "apikey", "x-api-token", "query"];
+
+function headersFor(style: AuthStyle, key: string): Record<string, string> {
+  const base = { Accept: "application/json" };
+  switch (style) {
+    case "bearer": return { ...base, Authorization: `Bearer ${key}` };
+    case "apikey": return { ...base, apikey: key }; // Supabase gateway
+    case "x-api-token": return { ...base, "X-Api-Token": key };
+    case "query": return base; // key rides in the query string instead
+    default: return { ...base, "X-API-Key": key };
+  }
+}
+
+/** A "query" style supplier wants ?api_key=… rather than a header. */
+function withKeyParam(url: string, style: AuthStyle, key: string): string {
+  if (style !== "query") return url;
+  return `${url}${url.includes("?") ? "&" : "?"}api_key=${encodeURIComponent(key)}`;
+}
+
+const styleOf = (s: SupplierRow): AuthStyle => {
+  const cfg = s.docsConfig as DocsConfig | null;
+  const st = cfg?.authStyle;
+  if (AUTH_STYLES.includes(st as AuthStyle)) return st as AuthStyle;
+  // Nothing proven yet: follow what the supplier's docs said (Qamify-style
+  // APIs are Bearer-only, so starting with X-API-Key cost a full re-detect).
+  if (/bearer/i.test(cfg?.authHeader ?? "")) return "bearer";
+  return "x-api-key";
+};
+
+/**
+ * Merge into the supplier's CURRENT docsConfig. Writing a copy read before a
+ * probe erased whatever the probe had just learned (the auth style), so every
+ * later call paid for detection again.
+ */
+async function mergeDocsConfig(id: string, patch: Partial<DocsConfig>): Promise<void> {
+  const cur = await prisma.supplier.findUnique({ where: { id }, select: { docsConfig: true } }).catch(() => null);
+  await prisma.supplier.update({ where: { id }, data: { docsConfig: { ...((cur?.docsConfig as DocsConfig | null) ?? {}), ...patch } as never } }).catch(() => undefined);
+}
+
+/**
+ * One connection attempt's budget. Without it a wrong key or a dead host ran
+ * hundreds of 8-second requests in a row — minutes of "loading" — and hammered
+ * the vendor into rate-limiting us.
+ */
+interface ProbeCtx { deadline: number; authTried: boolean; keyRejected: boolean; rejectedPaths: number }
+const newCtx = (ms: number): ProbeCtx => ({ deadline: Date.now() + ms, authTried: false, keyRejected: false, rejectedPaths: 0 });
+const expired = (c: ProbeCtx): boolean => Date.now() >= c.deadline;
+const reqSignal = (c?: ProbeCtx): AbortSignal => AbortSignal.timeout(c ? Math.max(1000, Math.min(8000, c.deadline - Date.now())) : 8000);
+
+/** A body that is an actual JSON document (not an HTML banner or docs page). */
+const looksJson = (text: string): boolean => {
+  const t = text.trim();
+  if (!(t.startsWith("{") || t.startsWith("["))) return false;
+  try { JSON.parse(t); return true; } catch { return false; }
+};
+
+/** Headers for a supplier, using the style already proven to work (or the default). */
+const authHeaders = (key: string, style: AuthStyle = "x-api-key"): Record<string, string> => headersFor(style, key);
+
+/**
+ * Find the auth style this supplier accepts, and store it. Called whenever a
+ * request comes back 401/403 with the style we assumed.
+ */
+export async function detectAuthStyle(s: SupplierRow, path = "/products", out?: { allAuthRejected: boolean }): Promise<AuthStyle | null> {
+  const key = decKey(s);
+  // The base root is usually a public banner that answers 200 to anything —
+  // "detecting" against it stored a wrong style over a correct one.
+  const probePath = path && path !== "/" ? path : "/products";
+  // All styles × URL variants AT ONCE (one ~8 s round instead of up to 15 in a
+  // row). A style only counts when it returns real JSON, not an HTML page.
+  const tries = AUTH_STYLES.flatMap((style) => urlCandidates(s.baseUrl, probePath).map((url) => ({ style, url })));
+  const statuses: number[] = [];
+  const winner = await Promise.any(tries.map(async ({ style, url }) => {
+    const res = await fetch(withKeyParam(url, style, key), { headers: headersFor(style, key), signal: AbortSignal.timeout(8000) });
+    statuses.push(res.status);
+    if (!res.ok) throw new Error(String(res.status));
+    const text = await res.text();
+    if (!looksJson(text)) throw new Error("not json");
+    return style;
+  })).catch(() => null);
+  if (!winner) {
+    // Only "every single try said 401/403" means the KEY is wrong; a 404 or a
+    // timeout means this path is wrong, and other endpoints may still work.
+    if (out) out.allAuthRejected = statuses.length === tries.length && statuses.every((st) => st === 401 || st === 403);
+    return null;
+  }
+  // Mutate the row in hand too, so the rest of THIS probe uses the new style.
+  s.docsConfig = { ...((s.docsConfig as DocsConfig | null) ?? {}), authStyle: winner };
+  await mergeDocsConfig(s.id, { authStyle: winner });
+  return winner;
+}
+
+/** URL candidates: as given, and with an /api/v1 prefix if the base has no version segment. */
+function urlCandidates(baseUrl: string, path: string): string[] {
+  const b = baseUrl.replace(/\/$/, "");
+  // Already versioned (…/api/v1 or …/v1), or the path carries its own version.
+  const hasVersion = /\/(api\/)?v\d+(\/|$)/.test(b) || /^\/(api\/)?v\d+\//.test(path);
+  // Unversioned base: try as given, then /api/v1 and plain /v1 (api.qamify.site
+  // serves /v1/products, /v1/orders — the old candidates never reached them).
+  return hasVersion ? [`${b}${path}`] : [`${b}${path}`, `${b}/api/v1${path}`, `${b}/v1${path}`];
+}
+
+/** Fetch that tolerates a missing /api/v1 prefix (retries the versioned URL on 404). */
+async function supFetch(s: SupplierRow, path: string, init: RequestInit = {}, retryAuth = true, ctx?: ProbeCtx): Promise<Response> {
+  const key = decKey(s);
+  const style = styleOf(s);
+  const headers = { ...headersFor(style, key), ...(init.headers as Record<string, string> | undefined) };
+  let last: Response | null = null;
+  for (const url of urlCandidates(s.baseUrl, path)) {
+    if (ctx && expired(ctx) && last) break;
+    const res = await fetch(withKeyParam(url, style, key), { ...init, headers, signal: reqSignal(ctx) });
+    if (res.status === 401 || res.status === 403) {
+      // Wrong style, not a wrong key: find the right one ONCE per attempt, then
+      // retry. If no style works the key itself is wrong — say so and stop,
+      // instead of re-detecting on every path.
+      if (!retryAuth || (ctx && ctx.authTried)) return res;
+      const out = { allAuthRejected: false };
+      if (await detectAuthStyle(s, path, out)) {
+        if (ctx) ctx.authTried = true; // style found — later paths use it directly
+        return supFetch(s, path, init, false, ctx);
+      }
+      // No style worked HERE. Only when every style is refused (401/403) on two
+      // different paths is the key itself wrong; a 404 just means a wrong path,
+      // so detection is tried again on the next one.
+      if (ctx && out.allAuthRejected && ++ctx.rejectedPaths >= 2) { ctx.authTried = true; ctx.keyRejected = true; }
+      return res;
+    }
+    if (res.status !== 404) return res;
+    last = res;
+  }
+  return last as Response;
+}
+const decKey = (s: SupplierRow): string => decryptSecret(s.apiKeyEnc, loadConfig().ENCRYPTION_MASTER_KEY);
+
+function pickStr(o: any, keys: string[]): string {
+  for (const k of keys) { const v = o?.[k]; if (typeof v === "string" && v.trim()) return v; if (typeof v === "number") return String(v); }
+  return "";
+}
+function pickNum(o: any, keys: string[]): number | null {
+  for (const k of keys) { const v = o?.[k]; if (typeof v === "number") return v; if (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v))) return Number(v); }
+  return null;
+}
+
+// ── CRUD ──
+/**
+ * Clean up a pasted base URL. People paste "api.x.com", an endpoint
+ * ("…/v1/products"), the docs page ("…/docs#/orders") or add trailing
+ * slashes — each made every request fail or hit "…/products/products".
+ */
+export function normalizeSupplierBaseUrl(raw: string): string {
+  let t = raw.trim().replace(/^<|>$/g, "");
+  if (!/^https?:\/\//i.test(t)) t = `https://${t}`;
+  try {
+    const u = new URL(t);
+    u.hash = "";
+    let path = u.pathname.replace(/\/+$/, "");
+    // A pasted endpoint is not the base. (A docs page is kept: the add flow's
+    // normalizeSupplierBase strips it AND reads the OpenAPI spec beside it.)
+    path = path.replace(/\/(products?|catalog|items|orders?|balance|services)$/i, "");
+    u.pathname = path || "/";
+    const out = `${u.origin}${u.pathname === "/" ? "" : u.pathname}${u.search}`;
+    return out.replace(/\/+$/, "");
+  } catch {
+    return raw.trim().replace(/\/+$/, "");
+  }
+}
+
+export async function addSupplier(name: string, baseUrl: string, apiKey: string, markupPct = 20): Promise<{ id: string }> {
+  const enc = encryptSecret(apiKey.trim(), loadConfig().ENCRYPTION_MASTER_KEY);
+  const s = await prisma.supplier.create({ data: { name: name.slice(0, 80), baseUrl: normalizeSupplierBaseUrl(baseUrl), apiKeyEnc: enc, markupBp: Math.max(0, Math.round(markupPct * 100)) } });
+  return { id: s.id };
+}
+export async function listSuppliers(): Promise<Array<{ id: string; name: string; markupBp: number; active: boolean; baseUrl: string }>> {
+  const rows = await prisma.supplier.findMany({ orderBy: { createdAt: "asc" } });
+  return rows.map((r) => ({ id: r.id, name: r.name, markupBp: r.markupBp, active: r.active, baseUrl: r.baseUrl }));
+}
+/**
+ * Do newly synced products go straight into the shop, or arrive hidden?
+ *
+ * Default HIDDEN. Auto-sync imports everything a supplier offers, and a vendor
+ * with 2,000 SKUs would otherwise flood the shop and broadcast all of it to every
+ * customer the moment they were connected. Hidden-by-default means the sync is
+ * still automatic but you decide what appears, in bulk.
+ */
+const NEWVIS = (id: string) => `supplier.newvisible.${id}`;
+
+export async function getSupplierNewVisible(supplierId: string): Promise<boolean> {
+  const row = await prisma.setting.findUnique({ where: { key: NEWVIS(supplierId) } }).catch(() => null);
+  const v = row?.value as { on?: boolean } | null;
+  return v?.on === true;
+}
+
+export async function setSupplierNewVisible(supplierId: string, on: boolean): Promise<void> {
+  await prisma.setting.upsert({
+    where: { key: NEWVIS(supplierId) },
+    create: { key: NEWVIS(supplierId), value: { on } as never },
+    update: { value: { on } as never },
+  });
+}
+
+export type RemoveSupplierMode = "keep" | "hide" | "delete";
+
+/** How many shop products came from this supplier (for the delete confirmation). */
+export async function countSupplierProducts(supplierId: string): Promise<{ total: number; visible: number }> {
+  const [total, visible] = await Promise.all([
+    prisma.product.count({ where: { supplierId, deletedAt: null } }),
+    prisma.product.count({ where: { supplierId, deletedAt: null, status: "ACTIVE" } }),
+  ]);
+  return { total, visible };
+}
+
+/**
+ * Remove a vendor, and decide what happens to the products they brought in.
+ *
+ * Product.supplierId has no foreign key, so deleting the supplier row used to
+ * leave their products in the shop forever, pointing at a vendor that no longer
+ * exists and impossible to fulfil — a customer could still buy one.
+ *
+ *   "delete" — soft-delete them (default; recoverable, history intact)
+ *   "hide"   — keep the rows but pull them from the shop
+ *   "keep"   — leave them listed, unlinked from any supplier
+ */
+export async function removeSupplier(id: string, mode: RemoveSupplierMode = "delete"): Promise<{ affected: number }> {
+  const now = new Date();
+  let affected = 0;
+  if (mode === "delete") {
+    // Soft delete: never destroy a product row that orders may reference.
+    const r = await prisma.product.updateMany({
+      where: { supplierId: id, deletedAt: null },
+      data: { deletedAt: now, status: "ARCHIVED", supplierId: null, supplierRef: null },
+    });
+    affected = r.count;
+  } else if (mode === "hide") {
+    const r = await prisma.product.updateMany({
+      where: { supplierId: id, deletedAt: null },
+      // Unlink too, or a later sync from a re-added vendor could resurrect them.
+      data: { status: "PAUSED", supplierId: null, supplierRef: null },
+    });
+    affected = r.count;
+  } else {
+    // Keep them on sale but detach — they become ordinary manual products.
+    const r = await prisma.product.updateMany({
+      where: { supplierId: id, deletedAt: null },
+      data: { supplierId: null, supplierRef: null, fulfillmentMode: "MANUAL" },
+    });
+    affected = r.count;
+  }
+  await prisma.supplier.delete({ where: { id } }).catch(() => undefined);
+  await prisma.setting.delete({ where: { key: NEWVIS(id) } }).catch(() => undefined);
+  await invalidate("cat:*");
+  return { affected };
+}
+export async function setSupplierMarkup(id: string, pct: number): Promise<void> { await prisma.supplier.update({ where: { id }, data: { markupBp: Math.max(0, Math.round(pct * 100)) } }); }
+
+// ── HTTP (tolerant to common REST shapes) ──
+async function getJson(s: SupplierRow, path: string, ctx?: ProbeCtx): Promise<any> {
+  const res = await supFetch(s, path, {}, true, ctx);
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`);
+  return res.json();
+}
+
+const PRODUCT_PATHS = [
+  // A sibling shop running this same software (its own developer API).
+  "/api/v1/developer/products?all=true",
+  "/developer/products?all=true",
+  "/products", "/product", "/catalog", "/items", "/list",
+];
+/** Single-endpoint reseller APIs (Supabase functions etc.) select the operation with ?action=. */
+const PRODUCT_ACTIONS = ["products", "catalog", "list_products", "products_list", "list", "stock", "get_products"];
+
+/** Append query params to a base URL, respecting an existing query string. */
+function withQuery(baseUrl: string, params: Record<string, string | number>): string {
+  const b = baseUrl.replace(/\/$/, "");
+  const qs = Object.entries(params).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join("&");
+  return `${b}${b.includes("?") ? "&" : "?"}${qs}`;
+}
+
+/** GET the supplier base URL with ?action=… (no path probing). */
+async function actionGet(s: SupplierRow, params: Record<string, string | number>, ctx?: ProbeCtx): Promise<Response> {
+  return fetch(withKeyParam(withQuery(s.baseUrl, params), styleOf(s), decKey(s)), { headers: authHeaders(decKey(s), styleOf(s)), signal: reqSignal(ctx) });
+}
+
+/** Some APIs (including ours) quote prices in integer MINOR units. */
+function priceMinorOf(p: any): number {
+  const minor = pickNum(p, ["priceMinor", "fromPriceMinor", "amountMinor", "price_minor", "unitPriceMinor"]);
+  if (minor !== null) return Math.round(minor); // already minor units — do NOT scale
+  const v = pickNum(p?.variants?.[0] ?? {}, ["priceMinor", "amountMinor"]);
+  if (v !== null) return Math.round(v);
+  const major = pickNum(p, ["price", "amount", "cost", "priceUsd", "rate", "unit_price", "unitPrice", "sell_price", "sellPrice", "total_cost", "reseller_price", "resellerPrice"]);
+  return Math.round((major ?? 0) * 100);
+}
+
+function stockOf(p: any): number | null {
+  const direct = pickNum(p, ["stock", "available", "quantity", "qty", "inStock", "stock_count", "available_stock", "availableStock", "stock_available", "in_stock", "remaining", "count"]);
+  if (direct !== null) return direct;
+  const v = p?.variants?.[0];
+  if (v) {
+    if (v.unlimited === true) return null;
+    const vs = pickNum(v, ["stock", "available", "quantity"]);
+    if (vs !== null) return vs;
+  }
+  return null;
+}
+
+function parseProductArray(arr: any[]): SupplierProduct[] {
+  return arr
+    .map((p) => ({
+      ref: pickStr(p, ["id", "product_id", "productId", "service_id", "serviceId", "service", "sku", "code", "uuid", "_id"]),
+      name: pickStr(p, ["name", "title", "product", "label", "productName", "product_name"]) || "Product",
+      description: pickStr(p, ["description", "desc", "details", "info", "about", "content", "body", "long_description", "longDescription", "summary"]),
+      // NOTE: "warranty" is deliberately NOT read here — warranty is a real
+      // per-product toggle in this store, and importing a supplier's warranty
+      // blurb made it appear in the description even for no-warranty products.
+      note: pickStr(p, ["note", "notes", "instructions", "instruction", "terms", "guide", "activation", "how_to_use", "howToUse", "delivery_note", "deliveryNote"]),
+      priceMinor: priceMinorOf(p),
+      stock: stockOf(p),
+      // Sibling shops need the VARIANT id to place an order, not the product id.
+      variantRef: pickStr(p?.variants?.[0] ?? {}, ["id", "variantId"]) || undefined,
+    }))
+    .filter((p) => p.ref && p.priceMinor > 0);
+}
+
+/**
+ * Where is the list in this body? Vendors wrap it every way there is:
+ * a bare array, `{data:[…]}`, `{products:[…]}`, and — the one the old code
+ * missed — an object one level down, `{success:true, data:{products:[…]}}`,
+ * which read as "parsed 0 products" and made a working API look broken.
+ */
+function findProductArray(json: any): any[] {
+  if (Array.isArray(json)) return json;
+  if (!json || typeof json !== "object") return [];
+  // "services": SMM-style panels (arrsnetworkzone.in among them) call every
+  // product a service — the catalogue came back fine and read as 0 products.
+  const KEYS = ["items", "data", "products", "services", "service", "offers", "plans", "result", "results", "list", "catalog", "stock", "rows"];
+  for (const k of KEYS) {
+    const v = json[k];
+    if (Array.isArray(v)) return v;
+  }
+  for (const k of KEYS) {
+    const v = json[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      for (const k2 of KEYS) {
+        const v2 = v[k2];
+        if (Array.isArray(v2)) return v2;
+      }
+    }
+  }
+  return [];
+}
+
+/** Try common product endpoints; return the parsed products, plus the path used and a raw sample for diagnostics. */
+async function probeProducts(s: SupplierRow, opts: { deadlineMs?: number } = {}): Promise<{ products: SupplierProduct[]; path: string; raw: string; note: string; trail?: string[]; keyRejected?: boolean; timedOut?: boolean }> {
+  let lastRaw = "";
+  let lastNote = "";
+  const trail: string[] = [];
+  const note = (t: string): void => { lastNote = t; if (trail.length < 24) trail.push(t); };
+  const ctx = newCtx(opts.deadlineMs ?? 25_000);
+  const stop = (): boolean => expired(ctx) || ctx.keyRejected;
+  const base = s.baseUrl.replace(/\/+$/, "");
+  // Strategy: whatever we learned from the supplier's own documentation wins.
+  const doc = (s.docsConfig ?? null) as DocsConfig | null;
+  if (doc?.productsPath) {
+    for (const attempt of [doc.productsPath, `${doc.productsPath}${doc.productsPath.includes("?") ? "&" : "?"}all=true`]) {
+      if (stop()) break;
+      try {
+        const url = `${(doc.baseUrl ?? s.baseUrl).replace(/\/+$/, "")}${attempt}`;
+        // A timeout here too: this fetch had none, so a stalled supplier hung
+        // for the runtime's 5-minute default — "loading forever".
+        const res = await fetch(withKeyParam(url, styleOf(s), decKey(s)), { headers: authHeaders(decKey(s), styleOf(s)), signal: reqSignal(ctx) });
+        const text = await res.text().catch(() => "");
+        if (!res.ok) { note(`docs ${attempt} → HTTP ${res.status} ${text.slice(0, 100)}`); if (res.status === 404) break; continue; }
+        let json: any; try { json = JSON.parse(text); } catch { lastRaw = text.slice(0, 400); continue; }
+        const listed = atPath(json, doc.listField);
+        const arr: any[] = Array.isArray(listed) ? listed : findProductArray(json);
+        const products = parseProductArray(Array.isArray(arr) ? arr : []);
+        if (products.length > 0) return { products, path: `docs:${attempt}`, raw: text.slice(0, 400), note: "ok" };
+        lastRaw = text.slice(0, 400);
+        note(`docs ${attempt} → parsed 0 products`);
+      } catch (e) { note(`docs → ${String(e instanceof Error ? e.message : e).slice(0, 120)}`); }
+    }
+  }
+  for (const path of PRODUCT_PATHS) {
+    if (stop()) break;
+    try {
+      const res = await supFetch(s, path, {}, true, ctx);
+      const text = await res.text().catch(() => "");
+      if (!res.ok) { note(`${path || "/"} → HTTP ${res.status} ${text.slice(0, 120)}`); continue; }
+      let json: any;
+      try { json = JSON.parse(text); } catch { lastRaw = text.slice(0, 400); note(`${path || "/"} → non-JSON response`); continue; }
+      const arr: any[] = findProductArray(json);
+      const products = parseProductArray(arr);
+      if (products.length > 0) {
+        // Remember the path that ACTUALLY answered, version prefix included
+        // (/v1/products, not /products), so the next sync goes straight there.
+        let worked = path;
+        try {
+          const u = new URL(res.url);
+          u.searchParams.delete("api_key");
+          const full = `${u.origin}${u.pathname}${u.search}`;
+          if (full.startsWith(base)) worked = full.slice(base.length) || path;
+        } catch { /* keep the probed path */ }
+        void mergeDocsConfig(s.id, { productsPath: worked, baseUrl: base }); // the path is relative to THIS base
+        return { products, path: worked || "/", raw: text.slice(0, 400), note: "ok" };
+      }
+      lastRaw = text.slice(0, 400);
+      note(`${path || "/"} → parsed 0 products`);
+    } catch (e) { note(`${path || "/"} → ${String(e instanceof Error ? e.message : e).slice(0, 120)}`); }
+  }
+  // Action-style APIs: GET <base>?action=products
+  for (const action of PRODUCT_ACTIONS) {
+    if (stop()) break;
+    try {
+      const res = await actionGet(s, { action }, ctx);
+      const text = await res.text().catch(() => "");
+      if (!res.ok) { note(`?action=${action} → HTTP ${res.status} ${text.slice(0, 120)}`); continue; }
+      let json: any; try { json = JSON.parse(text); } catch { lastRaw = text.slice(0, 400); note(`?action=${action} → non-JSON`); continue; }
+      const arr: any[] = findProductArray(json);
+      const products = parseProductArray(Array.isArray(arr) ? arr : []);
+      if (products.length > 0) {
+        void mergeDocsConfig(s.id, { productsPath: `?action=${action}`, baseUrl: base });
+        return { products, path: `?action=${action}`, raw: text.slice(0, 400), note: "ok" };
+      }
+      lastRaw = text.slice(0, 400);
+      note(`?action=${action} → parsed 0 products`);
+    } catch (e) { note(`?action=${action} → ${String(e instanceof Error ? e.message : e).slice(0, 120)}`); }
+  }
+  // Fallback: some reseller APIs (e.g. Supabase functions) return the catalog via POST + an action.
+  for (const body of [
+    { action: "products" }, { action: "list_products" }, { action: "catalog" },
+    { action: "get_products" }, { action: "list" }, { action: "stock" },
+    { type: "products" }, { method: "products" },
+  ]) {
+    if (stop()) break;
+    try {
+      const res = await supFetch(s, "", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, true, ctx);
+      const text = await res.text().catch(() => "");
+      if (!res.ok) { note(`POST ${JSON.stringify(body)} → HTTP ${res.status} ${text.slice(0, 100)}`); continue; }
+      let json: any; try { json = JSON.parse(text); } catch { lastRaw = text.slice(0, 400); continue; }
+      const arr: any[] = findProductArray(json);
+      const products = parseProductArray(arr);
+      if (products.length > 0) return { products, path: `POST ${JSON.stringify(body)}`, raw: text.slice(0, 400), note: "ok" };
+      lastRaw = text.slice(0, 400);
+    } catch (e) { note(`POST → ${String(e instanceof Error ? e.message : e).slice(0, 120)}`); }
+  }
+  if (ctx.keyRejected) note("🔑 The supplier rejected this API key (HTTP 401/403) with every auth style — the key is wrong, expired or lacks permission.");
+  else if (expired(ctx)) note(`⏱ Stopped after ${Math.round((opts.deadlineMs ?? 25_000) / 1000)} s — the supplier is too slow or unreachable. Check the base URL.`);
+  return { products: [], path: "", raw: lastRaw, note: lastNote, trail, keyRejected: ctx.keyRejected, timedOut: !ctx.keyRejected && expired(ctx) };
+}
+
+export async function fetchSupplierProducts(s: SupplierRow): Promise<SupplierProduct[]> {
+  return (await probeProducts(s)).products;
+}
+
+/** Diagnostic for the admin: which endpoint worked, or the raw response so we can map fields. */
+export async function diagnoseSupplier(id: string): Promise<{ ok: boolean; detail: string }> {
+  const s = await prisma.supplier.findUnique({ where: { id } });
+  if (!s) return { ok: false, detail: "Supplier not found." };
+  const r = await probeProducts(s);
+  if (r.products.length > 0) {
+    return { ok: true, detail: `OK ✅ — endpoint ${r.path} returned ${r.products.length} product(s). e.g. ${r.products.slice(0, 2).map((p) => `${p.name} @ ${(p.priceMinor / 100).toFixed(2)}`).join("; ")}` };
+  }
+  return {
+    ok: false,
+    detail: [
+      "Couldn't read a product list from this supplier.",
+      `Tried: GET ${PRODUCT_PATHS.join(", ")}; GET ?action=${PRODUCT_ACTIONS.join("/")}; POST {action:…}.`,
+      "Attempts:",
+      (r.trail ?? [r.note]).map((t) => `• ${t}`).join("\n"),
+      "Raw response sample:",
+      r.raw || "(empty)",
+      "",
+      "If the raw sample above shows products, send it to support so the field mapping can be added.",
+    ].join("\n"),
+  };
+}
+
+export async function getSupplierBalance(s: SupplierRow, budgetMs = 12_000): Promise<number | null> {
+  // Bounded like the product probe: 10 paths × 8 s each, plus auth
+  // re-detection on every one, used to add a minute to every Test.
+  const ctx = newCtx(budgetMs);
+  const fields = ["balance", "amount", "credit", "wallet", "funds", "balance_usd", "balance_usdt", "credits"];
+  // The documented path first, then the spellings seen in the wild — a shop
+  // that reports the balance from GET /api/v1/me had no chance under "/balance".
+  const docCfg = (s.docsConfig ?? null) as DocsConfig | null;
+  const paths = [...new Set([docCfg?.balancePath, "/balance", "/me", "/account", "/user", "/wallet", "/profile"].filter((x): x is string => !!x).map((x) => (x.startsWith("/") ? x : `/${x}`)))];
+  for (const path of paths) {
+    if (expired(ctx) || ctx.keyRejected) return null;
+    try {
+      const j = await getJson(s, path, ctx);
+      const v = pickNum(j, fields) ?? pickNum(j.data ?? {}, fields) ?? pickNum(j.user ?? {}, fields) ?? pickNum(j.wallet ?? {}, fields) ?? pickNum(j.data?.wallet ?? {}, fields);
+      if (v !== null) return v;
+    } catch { /* next path */ }
+  }
+  for (const action of ["balance", "get_balance", "wallet"]) {
+    if (expired(ctx) || ctx.keyRejected) return null;
+    try {
+      const res = await actionGet(s, { action }, ctx);
+      if (!res.ok) continue;
+      const j: any = await res.json();
+      const v = pickNum(j, fields) ?? pickNum(j.data ?? {}, fields) ?? pickNum(j.wallet ?? {}, fields);
+      if (v !== null) return v;
+    } catch { /* next */ }
+  }
+  return null;
+}
+
+export async function testSupplier(id: string): Promise<{ ok: boolean; detail: string }> {
+  const s = await prisma.supplier.findUnique({ where: { id } });
+  if (!s) return { ok: false, detail: "Supplier not found." };
+  const probe = await probeProducts(s);
+  if (probe.products.length > 0) {
+    // Balance only once the connection is proven, with a short budget of its own.
+    const bal = await getSupplierBalance(s, 8_000).catch(() => null);
+    return { ok: true, detail: `OK ✅ — endpoint ${probe.path}, ${probe.products.length} product(s)${bal !== null ? ` · balance ${bal}` : ""}.` };
+  }
+  return { ok: false, detail: `No products read. ${probe.note}\nRaw sample:\n${(probe.raw || "(empty)").slice(0, 300)}` };
+}
+
+/** Place an order at the supplier and return the delivered key(s). Deducts the supplier-side balance. */
+const KEY_FIELD_RE = /(licen[sc]e|serial|voucher|redeem|coupon|activation|cd[_-]?key|game[_-]?key|product[_-]?key|\bkey\b|\bcode\b|\bcodes\b|credential|secret|\btoken\b|login|username|\buser\b|email|password|\bpass\b|\bpin\b|\baccount\b|\baccounts\b|\baccount\b|\baccounts\b|delivered|download|content)/i;
+// Never treat these as the delivered key even if they contain "key"/"id".
+const EXCLUDE_FIELD_RE = /(idempoten|request|trace|order[_-]?id|orderid|txn|transaction|invoice|reference|\bref\b|\bid\b|status|message|success|error|created|updated|timestamp)/i;
+const STATUS_WORDS = /^(true|false|ok|yes|no|success|failed|failure|error|pending|completed|done|processing|active|null|none|n\/a)$/i;
+
+/**
+ * The delivered units when the vendor lists them explicitly — an `items` /
+ * `codes` / `keys` / `accounts` / `deliveries` array of strings or of objects
+ * carrying `content` / `key` / `code` / `value` / `credential` (Qamify:
+ * `order.items[].content`). Used before the generic walk, which would also
+ * pick up the ORDER's own code ("RA-1A2B3C4D5E") as if it were a key.
+ */
+function structuredDelivered(j: any): string[] | null {
+  if (!j || typeof j !== "object") return null;
+  const holders = [j, j.order, j.data, j.result, j.data?.order].filter((h) => h && typeof h === "object");
+  for (const h of holders) {
+    for (const name of ["items", "codes", "keys", "accounts", "deliveries", "delivered", "licenses", "credentials"]) {
+      const arr = (h as Record<string, unknown>)[name];
+      if (!Array.isArray(arr) || arr.length === 0) continue;
+      const vals = arr.map((el) => {
+        if (typeof el === "string") return el.trim();
+        if (el && typeof el === "object") {
+          const o = el as Record<string, unknown>;
+          for (const k of ["content", "key", "code", "value", "credential", "credentials", "account", "license", "text", "data"]) {
+            const v = o[k];
+            if (typeof v === "string" && v.trim()) return v.trim();
+          }
+          // login + password style objects
+          const user = ["username", "email", "login", "user"].map((k) => o[k]).find((v): v is string => typeof v === "string" && v.trim() !== "");
+          const pass = ["password", "pass", "pwd"].map((k) => o[k]).find((v): v is string => typeof v === "string" && v.trim() !== "");
+          if (user && pass) return `${user}|${pass}`;
+        }
+        return "";
+      }).filter((v) => v.length > 0);
+      if (vals.length > 0) return [...new Set(vals)];
+    }
+  }
+  return null;
+}
+
+/** Deeply extract delivered credential strings from any supplier order response shape. */
+function extractDeliveredKeys(j: any, exclude: string[] = []): string[] {
+  const structured = structuredDelivered(j);
+  if (structured) return structured.filter((v) => !exclude.includes(v));
+  const out: string[] = [];
+  const bad = (v: string): boolean => v.startsWith("sup-") || exclude.some((e) => e && v === e);
+  const walk = (node: any, keyName?: string): void => {
+    if (node === null || node === undefined) return;
+    if (typeof node === "string") {
+      const v = node.trim();
+      if (v.length >= 4 && keyName && KEY_FIELD_RE.test(keyName) && !EXCLUDE_FIELD_RE.test(keyName) && !STATUS_WORDS.test(v) && !bad(v)) out.push(v);
+      return;
+    }
+    if (typeof node === "number") return;
+    if (Array.isArray(node)) { for (const el of node) walk(el, keyName); return; }
+    if (typeof node === "object") { for (const [k, val] of Object.entries(node)) walk(val, k); return; }
+  };
+  walk(j);
+  return [...new Set(out)];
+}
+
+/**
+ * Did the vendor say NO?
+ *
+ * A vendor can answer HTTP 200 and still refuse the order inside the body —
+ * `{"order":{"status":"failed","codes":[],"error":"bnpl_limit_exceeded"}}` is a
+ * real one. That used to be read as "accepted, no key yet", polled, and then
+ * reported to the admin as "Supplier CHARGED but no key parsed" — the opposite
+ * of what happened: nothing was charged, the vendor's own credit ran out.
+ * Returns the vendor's reason when the body is a refusal, else null.
+ */
+function supplierRejection(j: unknown): string | null {
+  if (!j || typeof j !== "object") return null;
+  const FAILED = new Set(["failed", "failure", "error", "rejected", "declined", "cancelled", "canceled", "insufficient_funds"]);
+  const look = (o: Record<string, unknown>): string | null => {
+    const status = typeof o.status === "string" ? o.status.toLowerCase() : "";
+    const flagged = o.success === false || o.ok === false || FAILED.has(status);
+    if (!flagged) return null;
+    const errObj = o.error && typeof o.error === "object" ? (o.error as Record<string, unknown>) : null;
+    const reason = [errObj?.code, errObj?.message, o.error, o.message, o.reason, o.detail, status]
+      .find((v): v is string => typeof v === "string" && v.trim() !== "");
+    return (reason ?? "rejected").slice(0, 160);
+  };
+  const top = look(j as Record<string, unknown>);
+  if (top) return top;
+  for (const key of ["order", "data", "result"]) {
+    const inner = (j as Record<string, unknown>)[key];
+    if (inner && typeof inner === "object") {
+      const r = look(inner as Record<string, unknown>);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
+export async function placeSupplierOrder(
+  supplierId: string,
+  ref: string,
+  qty = 1,
+  externalOrderId?: string,
+): Promise<{ ok: boolean; keys: string[]; reason?: string; raw?: string; rejected?: boolean }> {
+  const s = await prisma.supplier.findUnique({ where: { id: supplierId } });
+  if (!s) return { ok: false, keys: [], reason: "NO_SUPPLIER" };
+  // "productRef|variantRef" — a sibling shop running this software needs the
+  // VARIANT id to place an order.
+  const [rawRef, variantRef] = ref.includes("|") ? ref.split("|") : [ref, undefined];
+  const baseRef = rawRef ?? ref;
+  const pid: string | number = /^\d+$/.test(baseRef) ? Number(baseRef) : baseRef;
+  // A STABLE id per order line: a retry must never create a second order upstream.
+  const extId = externalOrderId ?? `sup-${supplierId}-${ref}-${qty}`;
+  const excl = [extId, String(ref), s.id, supplierId];
+  let lastRaw = "";
+  let lastReason = "";
+
+  const readKeys = (text: string): { keys: string[]; json: any } => {
+    let j: any; try { j = JSON.parse(text); } catch { j = text; }
+    return { keys: extractDeliveredKeys(j, excl), json: j };
+  };
+
+  // Strategy 0 — a sibling shop running this same software.
+  if (variantRef) {
+    for (const path of ["/api/v1/developer/orders", "/developer/orders", "/orders"]) {
+      try {
+        const res = await fetch(`${s.baseUrl.replace(/\/$/, "")}${path}`, {
+          method: "POST",
+          headers: { ...authHeaders(decKey(s), styleOf(s)), "Content-Type": "application/json", "Idempotency-Key": extId },
+          body: JSON.stringify({ variantId: variantRef, quantity: qty }),
+          signal: AbortSignal.timeout(12_000),
+        });
+        const text = await res.text().catch(() => "");
+        if (res.status === 404) continue;
+        lastRaw = text.slice(0, 500);
+        if (!res.ok) { lastReason = `${res.status} ${text.slice(0, 160)}`; break; }
+        const { keys, json } = readKeys(text);
+        if (keys.length > 0) return { ok: true, keys, raw: lastRaw };
+        const rej = supplierRejection(json);
+        if (rej) return { ok: false, keys: [], reason: `REJECTED: ${rej}`, raw: lastRaw, rejected: true };
+        lastReason = "ACCEPTED_NO_KEY";
+        return { ok: false, keys: [], reason: lastReason, raw: lastRaw };
+      } catch (e) { lastReason = String(e instanceof Error ? e.message : e).slice(0, 160); }
+    }
+  }
+
+  // Strategy A — action-style API: GET <base>?action=place_order&product_id=..&quantity=..&external_order_id=..
+  for (const action of ["place_order", "order", "create_order", "buy", "purchase", "new_order"]) {
+    try {
+      const res = await actionGet(s, { action, product_id: pid, quantity: qty, external_order_id: extId });
+      const text = await res.text().catch(() => "");
+      lastRaw = text.slice(0, 500);
+      if (res.status === 404) continue;
+      // Their documented duplicate guard: the order already exists and was NOT re-charged.
+      if (res.status === 409) {
+        const rec = await lookupSupplierOrder(s, extId, excl);
+        if (rec.keys.length > 0) return { ok: true, keys: rec.keys, raw: rec.raw };
+        lastReason = `409 duplicate, and order_status returned no accounts`;
+        lastRaw = rec.raw || lastRaw;
+        continue;
+      }
+      if (!res.ok) { lastReason = `${res.status} ${text.slice(0, 160)}`; continue; }
+      const { keys, json } = readKeys(text);
+      if (keys.length > 0) return { ok: true, keys, raw: lastRaw };
+      // A refusal in a 200 body is final — polling it would only re-read the refusal.
+      const rej = supplierRejection(json);
+      if (rej) return { ok: false, keys: [], reason: `REJECTED: ${rej}`, raw: lastRaw, rejected: true };
+      // Not an order API at all: a REST vendor answers its base URL with a
+      // service banner ({"ok":true,"service":"reseller-api","docs":"/docs"}).
+      // That was read as "order accepted, no key" — nothing had been bought,
+      // the REST order call was never made, and the admin was told the vendor
+      // charged. Only a reply that talks about an order counts as accepted.
+      if (!looksLikeOrderReply(json)) { lastReason = "base URL is not an action-style order API"; break; }
+      // Accepted but still processing — poll the status endpoint once.
+      const rec = await lookupSupplierOrder(s, extId, excl);
+      if (rec.keys.length > 0) return { ok: true, keys: rec.keys, raw: rec.raw };
+      // The supplier ACCEPTED this order (HTTP 2xx). Trying the next action name
+      // would place — and pay for — a second order. Stop and let an admin look.
+      return { ok: false, keys: [], reason: "ACCEPTED_NO_KEY", raw: lastRaw };
+    } catch (e) { lastReason = String(e instanceof Error ? e.message : e).slice(0, 160); }
+  }
+
+  // Strategy B — conventional REST. The path the vendor documents comes first
+  // (learnSupplierDocs records it and it was never read here), then the two
+  // spellings in the wild: `/orders` and `/order`. A shop such as
+  // arrsnetworkzone.in exposes POST /api/v1/order (singular) and answered 404
+  // to the only path this used to try.
+  const docCfg = (s.docsConfig ?? null) as DocsConfig | null;
+  const orderPaths = [...new Set([docCfg?.orderPath, "/orders", "/order"].filter((x): x is string => !!x).map((x) => (x.startsWith("/") ? x : `/${x}`)))];
+  for (const orderPath of orderPaths) {
+    try {
+      const post = (body: Record<string, unknown>) => supFetch(s, orderPath, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": extId },
+        body: JSON.stringify(body),
+      });
+      let res = await post({ product_id: pid, productId: pid, service_id: pid, serviceId: pid, id: pid, quantity: qty, qty, external_order_id: extId, externalOrderId: extId });
+      let text = await res.text().catch(() => "");
+      // A 400 means nothing was performed: a strict validator may refuse our
+      // extra field names, so try once more with only the essentials.
+      if (res.status === 400) {
+        res = await post({ product_id: pid, qty, quantity: qty });
+        text = await res.text().catch(() => "");
+      }
+      if (res.status === 404 || res.status === 405) { lastReason = `${res.status} ${orderPath}`; continue; }
+      lastRaw = text.slice(0, 500) || lastRaw;
+      let errJson: unknown = null; try { errJson = JSON.parse(text); } catch { /* not JSON */ }
+      const errCode = ((errJson as { error?: { code?: string; message?: string; retry_after_seconds?: number } } | null)?.error ?? null);
+      if (res.status === 409 && errCode?.code && errCode.code !== "idempotency_key_conflict") {
+        // out_of_stock, insufficient_balance, pricing_error … — refused, nothing charged.
+        return { ok: false, keys: [], reason: `REJECTED: ${errCode.code}${errCode.message ? ` — ${errCode.message}` : ""}`, raw: lastRaw, rejected: true };
+      }
+      if (res.status === 429) {
+        const wait = errCode?.retry_after_seconds ?? Number(res.headers.get("retry-after") ?? 0);
+        return { ok: false, keys: [], reason: `REJECTED: ${errCode?.code ?? "rate_limited"}${wait ? ` — vendor asks to wait ${Math.ceil(wait / 60)} min; retrying automatically` : ""}`, raw: lastRaw, rejected: true };
+      }
+      if (res.status === 409) {
+        // Same idempotency key already used: the order exists upstream — fetch it.
+        const rec = await lookupByIdempotency(s, orderPath, extId, excl);
+        if (rec.keys.length > 0) return { ok: true, keys: rec.keys, raw: rec.raw };
+        const rec2 = await lookupSupplierOrder(s, extId, excl);
+        if (rec2.keys.length > 0) return { ok: true, keys: rec2.keys, raw: rec2.raw };
+        lastReason = "409 duplicate, and the order lookup returned no key";
+        break;
+      }
+      if (!res.ok) {
+        const rej = supplierRejection(errJson);
+        if (rej && res.status >= 400 && res.status < 500) return { ok: false, keys: [], reason: `REJECTED: ${rej}`, raw: lastRaw, rejected: true };
+        lastReason = `${res.status} ${text.slice(0, 160)}`;
+        break;
+      }
+      const { keys, json } = readKeys(text);
+      if (keys.length > 0) return { ok: true, keys, raw: lastRaw };
+      const rej = supplierRejection(json);
+      if (rej) return { ok: false, keys: [], reason: `REJECTED: ${rej}`, raw: lastRaw, rejected: true };
+      // Accepted, still processing. Poll the order by ITS id at the same REST
+      // path (GET /order/{id}) a few times, then the action-style lookup.
+      const oid = supplierOrderId(json);
+      const rec = oid
+        ? await lookupSupplierOrderRest(s, orderPath, oid, excl)
+        : { keys: [], raw: "" };
+      if (rec.keys.length > 0) return { ok: true, keys: rec.keys, raw: rec.raw };
+      const rec2 = await lookupSupplierOrder(s, extId, excl);
+      if (rec2.keys.length > 0) return { ok: true, keys: rec2.keys, raw: rec2.raw };
+      // The vendor ACCEPTED (2xx) — trying another path would buy a second one.
+      return { ok: false, keys: [], reason: "ACCEPTED_NO_KEY", raw: lastRaw };
+    } catch (e) { lastReason = String(e instanceof Error ? e.message : e).slice(0, 160); }
+  }
+
+  return { ok: false, keys: [], reason: lastReason || "NO_KEY_IN_RESPONSE", raw: lastRaw };
+}
+
+/** Does a 2xx body actually describe an order (and not, say, a service banner)? */
+function looksLikeOrderReply(j: unknown): boolean {
+  if (!j || typeof j !== "object") return false;
+  if (supplierOrderId(j)) return true;
+  const o = j as Record<string, unknown>;
+  for (const h of [o, o.order, o.data, o.result]) {
+    if (!h || typeof h !== "object") continue;
+    const keys = Object.keys(h as object).map((k) => k.toLowerCase());
+    if (keys.some((k) => /order|status|external|delivered|items|accounts|codes|keys/.test(k))) return true;
+  }
+  return false;
+}
+
+/** Look an order up by our external id and pull the delivered accounts/keys out. */
+/** The vendor's own id for an order, from any of the usual places in a 2xx body. */
+function supplierOrderId(j: unknown): string | null {
+  if (!j || typeof j !== "object") return null;
+  const o = j as Record<string, unknown>;
+  for (const holder of [o, o.order, o.data, o.result]) {
+    if (!holder || typeof holder !== "object") continue;
+    const h = holder as Record<string, unknown>;
+    // `code` is an order code only inside an order object (Qamify "RA-…");
+    // at the top level it is usually an error code.
+    const keys = holder === o ? ["id", "order_id", "orderId", "orderNumber", "order_number"] : ["id", "order_id", "orderId", "orderNumber", "order_number", "code"];
+    for (const k of keys) {
+      const v = h[k];
+      if (typeof v === "number" || (typeof v === "string" && v.trim() !== "")) return String(v);
+    }
+  }
+  return null;
+}
+
+/**
+ * Poll `GET <orderPath>/<id>` for the keys of an order the vendor accepted but
+ * had not filled at the moment it answered. Three tries, a moment apart —
+ * most vendors fill within a couple of seconds; the 60 s retry sweep covers
+ * the ones that do not.
+ */
+async function lookupSupplierOrderRest(s: SupplierRow, orderPath: string, id: string, excl: string[]): Promise<{ keys: string[]; raw: string }> {
+  const base = orderPath.replace(/\/$/, "");
+  const paths = [...new Set([`${base}/${encodeURIComponent(id)}`, `/order/${encodeURIComponent(id)}`, `/orders/${encodeURIComponent(id)}`])];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 1500));
+    for (const path of paths) {
+      try {
+        const res = await supFetch(s, path, {}, false);
+        if (!res.ok) continue;
+        const text = await res.text().catch(() => "");
+        let j: unknown; try { j = JSON.parse(text); } catch { continue; }
+        const keys = extractDeliveredKeys(j, [...excl, id]);
+        if (keys.length > 0) return { keys, raw: text.slice(0, 500) };
+        if (supplierRejection(j)) return { keys: [], raw: text.slice(0, 500) };
+      } catch { /* next path */ }
+    }
+  }
+  return { keys: [], raw: "" };
+}
+
+/** Recover an order by OUR idempotency key (Qamify: GET /orders/by-idempotency/:key, then GET /orders/:code). Never charges. */
+async function lookupByIdempotency(s: SupplierRow, orderPath: string, key: string, excl: string[]): Promise<{ keys: string[]; raw: string }> {
+  const base = orderPath.replace(/\/$/, "");
+  try {
+    const res = await supFetch(s, `${base}/by-idempotency/${encodeURIComponent(key)}`, {}, false);
+    if (!res.ok) return { keys: [], raw: "" };
+    const text = await res.text().catch(() => "");
+    let j: unknown; try { j = JSON.parse(text); } catch { return { keys: [], raw: "" }; }
+    const direct = extractDeliveredKeys(j, [...excl, key]);
+    if (direct.length > 0) return { keys: direct, raw: text.slice(0, 500) };
+    const id = supplierOrderId(j);
+    return id ? lookupSupplierOrderRest(s, orderPath, id, excl) : { keys: [], raw: text.slice(0, 500) };
+  } catch {
+    return { keys: [], raw: "" };
+  }
+}
+
+async function lookupSupplierOrder(s: SupplierRow, extId: string, excl: string[]): Promise<{ keys: string[]; raw: string }> {
+  for (const action of ["order_status", "order", "status", "check_order"]) {
+    try {
+      const res = await actionGet(s, { action, external_order_id: extId });
+      const text = await res.text().catch(() => "");
+      if (!res.ok) continue;
+      let j: any; try { j = JSON.parse(text); } catch { continue; }
+      const keys = extractDeliveredKeys(j, excl);
+      if (keys.length > 0) return { keys, raw: text.slice(0, 500) };
+    } catch { /* try the next action name */ }
+  }
+  return { keys: [], raw: "" };
+}
+
+/** Import/refresh a supplier's catalog into our products (with markup). */
+
+/** Docs/UI suffixes that are NOT an API base. */
+const DOCS_SUFFIX_RE = /\/(swagger(-ui)?|api-docs|apidocs|docs|documentation|redoc|openapi|scalar)(\.html?|\/index\.html?|\/)?$/i;
+
+/**
+ * People paste the Swagger/docs page as the "API base URL" — the connector then
+ * fetches HTML and every call 401s. Detect that, strip back to the real base,
+ * and read the OpenAPI spec sitting next to it so endpoints self-configure.
+ */
+export async function normalizeSupplierBase(supplierId: string): Promise<{ changed: boolean; detail: string }> {
+  const sup = await prisma.supplier.findUnique({ where: { id: supplierId } });
+  if (!sup) return { changed: false, detail: "Supplier not found." };
+  const raw = sup.baseUrl.replace(/\/+$/, "");
+  if (!DOCS_SUFFIX_RE.test(raw)) return { changed: false, detail: "" };
+
+  const stripped = raw.replace(DOCS_SUFFIX_RE, "");
+  const specUrls = [`${raw}.json`, `${raw}/swagger.json`, `${raw}/openapi.json`, `${stripped}/swagger.json`, `${stripped}/openapi.json`, `${stripped}/v1/swagger.json`];
+  let learned = "";
+  await prisma.supplier.update({ where: { id: supplierId }, data: { baseUrl: stripped } });
+  for (const u of specUrls) {
+    try {
+      const res = await fetch(withKeyParam(u, styleOf(sup), decKey(sup)), { headers: authHeaders(decKey(sup), styleOf(sup)), signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const body = await res.text();
+      if (!/"paths"\s*:/.test(body)) continue;
+      const r = await learnSupplierDocs(supplierId, body);
+      learned = `\n📄 Read the OpenAPI spec at <code>${u}</code>\n${r.detail}`;
+      break;
+    } catch { /* next candidate */ }
+  }
+  return {
+    changed: true,
+    detail: [
+      "🔧 <b>That looked like a documentation page, not an API base.</b>",
+      `Base URL corrected to <code>${stripped}</code>.`,
+      learned || "\n⚠️ No OpenAPI spec found beside it — tap 🔎 Auto-find docs.",
+    ].join("\n"),
+  };
+}
+
+export interface SyncResult {
+  added: number;
+  updated: number;
+  /** Matched a product the operator had deleted — deliberately left alone. */
+  skipped: number;
+  /** Threw while importing. One bad row must not abort the whole catalogue. */
+  failed: number;
+  busy?: boolean;
+  /** The supplier returned no products at all (key/URL problem or outage). */
+  empty?: boolean;
+  /** Already up to date — nothing written. */
+  unchanged?: number;
+}
+
+/** One sync at a time per supplier — repeated 🔄 taps used to stack probe storms. */
+export async function syncSupplierProducts(supplierId: string): Promise<SyncResult> {
+  const lockKey = `suplock:${supplierId}`;
+  // Longer than the slowest sync (probe budget + a large catalogue): a 120 s
+  // lock expired mid-sync, a second sync started, and both created the same
+  // products (duplicates with "-1" slugs).
+  const got = await getRedis().set(lockKey, "1", "EX", 900, "NX").catch(() => "OK");
+  if (got !== "OK") return { added: 0, updated: 0, skipped: 0, failed: 0, busy: true };
+  try {
+    return await syncSupplierProductsInner(supplierId);
+  } finally {
+    await getRedis().del(lockKey).catch(() => undefined);
+  }
+}
+
+/**
+ * Re-sync every active supplier: prices, stock, and the visibility that follows
+ * from stock.
+ *
+ * Until now a sync only happened when an admin tapped 🔄, so a supplier's
+ * sell-out or price rise reached this shop whenever somebody remembered to
+ * look — the shop kept selling what the supplier no longer had, at a price the
+ * supplier no longer charged. This is the sweep that makes the connection mean
+ * something. Suppliers are done one at a time, and each is skipped if its own
+ * lock is held, so a manual sync and this never collide.
+ */
+export async function syncAllSuppliers(): Promise<{ suppliers: number; updated: number; added: number; failed: number }> {
+  const rows = await prisma.supplier.findMany({ where: { active: true }, select: { id: true } });
+  let updated = 0, added = 0, failed = 0, suppliers = 0;
+  for (const r of rows) {
+    // Failing suppliers wait 30 min before the sweep probes them again; a
+    // manual 🔄 Sync still runs at once.
+    if (await getRedis().exists(`supfail:${r.id}`).catch(() => 0)) continue;
+    try {
+      const res = await syncSupplierProducts(r.id);
+      if (res.busy) continue;
+      suppliers++;
+      updated += res.updated;
+      added += res.added;
+      failed += res.failed;
+    } catch {
+      failed++;
+    }
+  }
+  return { suppliers, updated, added, failed };
+}
+
+async function syncSupplierProductsInner(supplierId: string): Promise<SyncResult> {
+  const s = await prisma.supplier.findUnique({ where: { id: supplierId } });
+  if (!s) return { added: 0, updated: 0, skipped: 0, failed: 0 };
+  const prods = await fetchSupplierProducts(s);
+  // A supplier that answers nothing (wrong key, down) is not re-probed by the
+  // 5-minute sweep for a while — see syncAllSuppliers.
+  if (prods.length === 0) {
+    await getRedis().set(`supfail:${supplierId}`, "1", "EX", 1800).catch(() => undefined);
+    return { added: 0, updated: 0, skipped: 0, failed: 0, empty: true };
+  }
+  await getRedis().del(`supfail:${supplierId}`).catch(() => undefined);
+  const retail = await prisma.priceTier.findUniqueOrThrow({ where: { name: "RETAIL" } });
+  // Everything this supplier already has, in ONE query. The old loop did a
+  // findFirst + update + two upserts per product, every 5 minutes, even when
+  // nothing had changed — thousands of queries for a big catalogue.
+  const known = await prisma.product.findMany({
+    where: { supplierId: s.id },
+    include: { variants: { orderBy: { sortOrder: "asc" }, include: { prices: { where: { tierId: retail.id } } } } },
+  });
+  const byRef = new Map<string, (typeof known)[number]>();
+  for (const k of known) if (k.supplierRef) byRef.set(k.supplierRef, k);
+  const seenNew = new Set<string>();
+  let unchanged = 0;
+  const rate = usdtRate("INR");
+  let cat = await prisma.category.findFirst({ where: { slug: "uncategorized" } });
+  if (!cat) cat = await prisma.category.create({ data: { name: "Uncategorized", slug: "uncategorized", sortOrder: 999 } });
+  // Auto-sync imports everything, but new items are HIDDEN unless the operator
+  // opted in — see getSupplierNewVisible.
+  const goLive = await getSupplierNewVisible(supplierId);
+  let added = 0, updated = 0, skipped = 0, failed = 0;
+  const newIds: string[] = [];
+  for (const p of prods) {
+    try {
+    const priceMinor = Math.max(1, Math.round(p.priceMinor * (1 + s.markupBp / 10000)));
+    const inrMinor = Math.round(priceMinor * rate);
+    const inStock = p.stock === null || p.stock > 0; // null = API doesn't report stock → treat as available
+    const refKey = p.variantRef ? `${p.ref}|${p.variantRef}` : p.ref;
+    // Soft-deleted rows are included on purpose: finding one tells us the operator
+    // already rejected this product, so we skip it instead of re-creating it.
+    if (seenNew.has(refKey)) { unchanged++; continue; }
+    const existing = byRef.get(refKey) ?? byRef.get(p.ref) ?? null;
+    if (existing?.deletedAt) {
+      // The operator deleted this one. Leave it dead — do not touch its price,
+      // its status, or resurrect it. "Restore" in the picker is the way back.
+      skipped++;
+      continue;
+    }
+    if (existing) {
+      // Stock drives visibility ONLY for products the operator has already
+      // published. A hidden product must stay hidden — sync bringing it back into
+      // the shop on the next stock change would undo every bulk hide.
+      const nextStatus = existing.status === "ARCHIVED" || existing.status === "DRAFT"
+        ? existing.status
+        : existing.status === "PAUSED" && !existing.supplierStockDrivenPause
+          ? "PAUSED"
+          : inStock ? "ACTIVE" : "PAUSED";
+      const data = {
+        name: p.name.slice(0, 200),
+        description: p.description.slice(0, 4000) || null,
+        activationGuide: p.note.slice(0, 2000) || null,
+        supplierStock: p.stock,
+        status: nextStatus as typeof existing.status,
+        // Remember WHY it is paused, so the rule above can tell an out-of-stock
+        // pause (sync may unpause) from a manual hide (sync must not).
+        supplierStockDrivenPause: nextStatus === "PAUSED" ? !inStock : false,
+      };
+      const v = existing.variants[0];
+      const priceOf = (cur: "USD" | "INR") => v?.prices.find((x) => x.currency === cur)?.amountMinor;
+      const pricesSame = !v || existing.priceLocked || (priceOf("USD") === priceMinor && priceOf("INR") === inrMinor);
+      const rowSame = existing.name === data.name && existing.description === data.description && existing.activationGuide === data.activationGuide
+        && existing.supplierStock === data.supplierStock && existing.status === data.status && existing.supplierStockDrivenPause === data.supplierStockDrivenPause;
+      if (rowSame && pricesSame) { unchanged++; continue; } // nothing changed — no writes
+      if (!rowSame) { await prisma.product.update({ where: { id: existing.id }, data }); Object.assign(existing, data); }
+      if (v && !pricesSame) for (const [currency, amt] of [["USD", priceMinor], ["INR", inrMinor]] as const) {
+        const row = await prisma.variantPrice.upsert({ where: { variantId_tierId_currency: { variantId: v.id, tierId: retail.id, currency } }, create: { variantId: v.id, tierId: retail.id, currency, amountMinor: amt }, update: { amountMinor: amt } });
+        // Keep the preloaded copy current: two catalogue rows can map to one product.
+        const i = v.prices.findIndex((x) => x.currency === currency);
+        if (i >= 0) v.prices[i] = row; else v.prices.push(row);
+      }
+      updated++;
+    } else {
+      // Out-of-stock products USED TO be dropped here, which is why the review
+      // list never matched what the vendor actually offers. Import everything —
+      // visibility is the operator's decision, not the stock level's.
+      const base = `sup-${s.id.slice(0, 6)}-${p.ref}`.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 52);
+      // A new product is only ACTIVE if the operator opted in AND it is sellable.
+      const status = goLive && inStock ? "ACTIVE" : "PAUSED";
+      // stock-driven ONLY when the operator wanted it live and stock is what
+      // stopped it. Anything else is a sticky hide that sync must not override.
+      const stockDriven = goLive && !inStock;
+
+      let created: { id: string } | null = null;
+      for (let attempt = 0; attempt < 5 && !created; attempt++) {
+        const slug = (attempt === 0 ? base : `${base}-${attempt}`).slice(0, 60);
+        try {
+          created = await prisma.product.create({
+            data: {
+              slug, name: p.name.slice(0, 200), description: p.description.slice(0, 4000) || null,
+              activationGuide: p.note.slice(0, 2000) || null,
+              type: "MANUAL_SERVICE", status, fulfillmentMode: "MANUAL", categoryId: cat.id,
+              supplierStockDrivenPause: stockDriven,
+              supplierId: s.id, supplierRef: refKey, supplierStock: p.stock,
+              variants: { create: { name: "Standard", sku: `${slug}-std`.slice(0, 64), sortOrder: 0, prices: { create: [{ tierId: retail.id, currency: "USD", amountMinor: priceMinor }, { tierId: retail.id, currency: "INR", amountMinor: inrMinor }] } } },
+            },
+            select: { id: true },
+          });
+        } catch (e) {
+          // Two supplier refs can normalise to the same slug once truncated.
+          // Only a uniqueness clash is worth retrying — rethrow anything else.
+          if ((e as { code?: string })?.code !== "P2002") throw e;
+        }
+      }
+      if (!created) throw new Error(`could not allocate a unique slug for ${p.ref}`);
+      // The same ref twice in one catalogue must not create two products.
+      seenNew.add(refKey);
+      // Only ACTIVE products are worth announcing.
+      if (status === "ACTIVE") newIds.push(created.id);
+      added++;
+    }
+    } catch (e) {
+      // One malformed product must never abort the rest of the catalogue.
+      failed++;
+      await logEvent("supplier", "warn", "supplier.sync", `Skipped ${p.ref}: ${String(e instanceof Error ? e.message : e).slice(0, 200)}`, { supplierId }).catch(() => undefined);
+    }
+  }
+  await invalidate("cat:*");
+  // Only announce what customers can actually see. Broadcasting products that are
+  // hidden would advertise things nobody can buy.
+  if (newIds.length > 0 && goLive) {
+    if (newIds.length <= 3) {
+      for (const pid of newIds) await announceProduct(pid, { createdById: "supplier-sync", force: true }).catch(() => undefined);
+    } else {
+      const uname = loadConfig().BOT_USERNAME;
+      await sendBroadcast({
+        title: "",
+        body: `🆕 <b>${newIds.length} new products just added!</b>\nBrowse the shop and grab them before they're gone. 🔥`,
+        bodyIsHtml: true,
+        segment: "all",
+        buttonText: uname ? "🛒 Browse shop" : undefined,
+        buttonUrl: uname ? `https://t.me/${uname}?start=menu` : undefined,
+        createdById: "supplier-sync",
+      }).catch(() => undefined);
+    }
+  }
+  return { added, updated, skipped, failed, unchanged };
+}
+
+export interface SupplierProductRow {
+  id: string;
+  name: string;
+  visible: boolean;
+  priceMinor: number;
+  stock: number | null;
+}
+
+/**
+ * One page of a supplier's products, for the bulk picker.
+ *
+ * Paged because a vendor can easily have thousands: the old version took the first
+ * 30 with no paging, so everything beyond that was unreachable — you could not hide
+ * a product you could not see.
+ */
+export type SupplierFilter = "all" | "visible" | "hidden" | "deleted";
+
+/**
+ * Prisma `where` for one filter tab.
+ *
+ * "all" deliberately means "all live rows" — deleted products only appear under
+ * their own tab, so a delete visibly removes something from the working list
+ * while still being recoverable.
+ */
+export function supplierFilterWhere(supplierId: string, only: SupplierFilter) {
+  if (only === "deleted") return { supplierId, deletedAt: { not: null } };
+  return {
+    supplierId,
+    deletedAt: null,
+    ...(only === "visible" ? { status: "ACTIVE" as const } : {}),
+    ...(only === "hidden" ? { status: { not: "ACTIVE" as const } } : {}),
+  };
+}
+
+export async function listSupplierProducts(
+  supplierId: string,
+  opts: { page?: number; pageSize?: number; search?: string; only?: SupplierFilter } = {},
+): Promise<{ items: SupplierProductRow[]; page: number; pages: number; total: number; visibleTotal: number }> {
+  const pageSize = Math.min(50, Math.max(5, opts.pageSize ?? 12));
+  const only = opts.only ?? "all";
+  const where = {
+    ...supplierFilterWhere(supplierId, only),
+    ...(opts.search ? { name: { contains: opts.search, mode: "insensitive" as const } } : {}),
+  };
+  const [total, visibleTotal] = await Promise.all([
+    prisma.product.count({ where }),
+    prisma.product.count({ where: { supplierId, deletedAt: null, status: "ACTIVE" } }),
+  ]);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(1, opts.page ?? 1), pages);
+  const rows = await prisma.product.findMany({
+    where,
+    orderBy: { name: "asc" },
+    skip: (page - 1) * pageSize,
+    take: pageSize,
+    include: { variants: { include: { prices: { where: { currency: "USD", tier: { name: "RETAIL" } } } } } },
+  });
+  return {
+    items: rows.map((p) => ({
+      id: p.id,
+      name: p.name,
+      visible: p.status === "ACTIVE",
+      priceMinor: p.variants[0]?.prices[0]?.amountMinor ?? 0,
+      stock: p.supplierStock,
+    })),
+    page,
+    pages,
+    total,
+    visibleTotal,
+  };
+}
+
+/** Ids on one page — so "select all on page" doesn't need the client to know them. */
+export async function supplierProductIdsOnPage(
+  supplierId: string,
+  opts: { page?: number; pageSize?: number; only?: SupplierFilter } = {},
+): Promise<string[]> {
+  const r = await listSupplierProducts(supplierId, opts);
+  return r.items.map((i) => i.id);
+}
+
+/** Every id matching the current filter — for "select all N". */
+export async function supplierProductIdsAll(
+  supplierId: string,
+  only: SupplierFilter = "all",
+  cap = 500,
+): Promise<string[]> {
+  const rows = await prisma.product.findMany({
+    where: supplierFilterWhere(supplierId, only),
+    orderBy: { name: "asc" },
+    take: cap,
+    select: { id: true },
+  });
+  return rows.map((r) => r.id);
+}
+
+/** Counts for the picker header, in one round trip. */
+export async function countSupplierProductStates(
+  supplierId: string,
+): Promise<{ shown: number; hidden: number; deleted: number }> {
+  const [shown, hidden, deleted] = await Promise.all([
+    prisma.product.count({ where: supplierFilterWhere(supplierId, "visible") }),
+    prisma.product.count({ where: supplierFilterWhere(supplierId, "hidden") }),
+    prisma.product.count({ where: supplierFilterWhere(supplierId, "deleted") }),
+  ]);
+  return { shown, hidden, deleted };
+}
+
+/**
+ * Bulk show / hide / delete, scoped to ONE supplier.
+ *
+ * The supplierId in the where clause is not decoration: it stops a stale or
+ * tampered selection from touching another vendor's products.
+ */
+export type SupplierBulkAction = "show" | "hide" | "delete" | "restore";
+
+export async function bulkSupplierProducts(
+  supplierId: string,
+  productIds: string[],
+  action: SupplierBulkAction,
+): Promise<number> {
+  const ids = [...new Set(productIds)].slice(0, 500);
+  if (ids.length === 0) return 0;
+  // "restore" is the only action that operates on already-deleted rows.
+  const where = { id: { in: ids }, supplierId, ...(action === "restore" ? { deletedAt: { not: null } } : { deletedAt: null }) };
+  let count = 0;
+  if (action === "show") {
+    ({ count } = await prisma.product.updateMany({ where, data: { status: "ACTIVE", supplierStockDrivenPause: false } }));
+  } else if (action === "hide") {
+    // supplierStockDrivenPause false marks this as a MANUAL hide, so the next sync
+    // will not helpfully put it back in the shop.
+    ({ count } = await prisma.product.updateMany({ where, data: { status: "PAUSED", supplierStockDrivenPause: false } }));
+  } else if (action === "restore") {
+    // Comes back HIDDEN, never straight to the shelf — restoring is a decision to
+    // reconsider a product, not a decision to sell it.
+    ({ count } = await prisma.product.updateMany({ where, data: { deletedAt: null, status: "PAUSED", supplierStockDrivenPause: false } }));
+  } else {
+    // Soft delete — orders reference these rows, so they are never destroyed.
+    // supplierId is deliberately KEPT: the next sync matches on it and skips the
+    // row, which is what stops a deleted product reappearing on every sync.
+    ({ count } = await prisma.product.updateMany({ where, data: { deletedAt: new Date(), status: "ARCHIVED", supplierStockDrivenPause: false } }));
+  }
+  await invalidate("cat:*");
+  return count;
+}
+
+/**
+ * Whole-catalogue action, with no 500-id ceiling.
+ *
+ * The picker's "every product" buttons used to collect ids first and then bulk
+ * them, which silently stopped at 500 while reporting success — on a 2,000-SKU
+ * vendor three quarters of the catalogue quietly stayed as it was.
+ */
+export async function bulkAllSupplierProducts(
+  supplierId: string,
+  action: SupplierBulkAction,
+  only: SupplierFilter = "all",
+): Promise<number> {
+  const where = supplierFilterWhere(supplierId, action === "restore" ? "deleted" : only);
+  const data =
+    action === "show" ? { status: "ACTIVE" as const, supplierStockDrivenPause: false }
+    : action === "hide" ? { status: "PAUSED" as const, supplierStockDrivenPause: false }
+    : action === "restore" ? { deletedAt: null, status: "PAUSED" as const, supplierStockDrivenPause: false }
+    : { deletedAt: new Date(), status: "ARCHIVED" as const, supplierStockDrivenPause: false };
+  const { count } = await prisma.product.updateMany({ where, data });
+  await invalidate("cat:*");
+  return count;
+}
+
+/** Show/hide a supplier product in the shop. */
+export async function setSupplierProductVisible(productId: string, visible: boolean): Promise<void> {
+  await prisma.product.update({ where: { id: productId }, data: { status: visible ? "ACTIVE" : "PAUSED" } });
+  await invalidate("cat:*");
+}
+
+/** Show or hide ALL of a supplier's products at once. */
+export async function setAllSupplierProductsVisible(supplierId: string, visible: boolean): Promise<number> {
+  const r = await prisma.product.updateMany({ where: { supplierId, deletedAt: null }, data: { status: visible ? "ACTIVE" : "PAUSED" } });
+  await invalidate("cat:*");
+  return r.count;
+}
+
+/** Fulfill an order item by buying from its linked supplier and delivering the key. */
+/**
+ * The retry sweep runs every minute; without this every failed attempt sent the
+ * same alert again (three identical warnings in two minutes). One alert per
+ * order line and reason, every 6 hours.
+ */
+async function alertOnce(orderItemId: string, reason: string): Promise<boolean> {
+  const tag = reason.replace(/[^A-Za-z0-9_:-]/g, "").slice(0, 40) || "x";
+  const ok = await getRedis().set(`supalert:${orderItemId}:${tag}`, "1", "EX", 6 * 3600, "NX").catch(() => "OK");
+  return ok === "OK";
+}
+
+export async function fulfillFromSupplier(orderItemId: string): Promise<{ ok: boolean; reason?: string }> {
+  const item = await prisma.orderItem.findUnique({ where: { id: orderItemId }, include: { variant: { include: { product: true } } } });
+  if (!item) return { ok: false, reason: "NOT_FOUND" };
+  // Already delivered — buying a second unit for it spends real money on a key
+  // manualFulfillItem would then refuse to attach.
+  if (item.fulfilledAt) return { ok: false, reason: "ALREADY_FULFILLED" };
+  const { supplierId, supplierRef } = item.variant.product;
+  if (!supplierId || !supplierRef) return { ok: false, reason: "NOT_SUPPLIER" };
+  // One purchase at a time per order line. The post-checkout auto-fulfil is
+  // fire-and-forget and the 60s retry sweep only waits a minute — a vendor that
+  // takes longer than that to answer had BOTH of them buying the same line, and
+  // the stable external id only helps with vendors that honour it.
+  const lockKey = `supfulfil:${orderItemId}`;
+  const got = await getRedis().set(lockKey, "1", "EX", 180, "NX").catch(() => "OK");
+  if (got !== "OK") return { ok: false, reason: "BUSY" };
+  // The alerts below are parse_mode: HTML and the product name came from a
+  // vendor's API — one "<" in it and Telegram drops the whole warning, which is
+  // the one message that says money was spent and nothing was delivered.
+  const esc = (x: string): string => x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  try {
+    // Stable per-order-line id → the supplier de-dupes retries instead of double-charging.
+    const r = await placeSupplierOrder(supplierId, supplierRef, item.quantity, `oi-${orderItemId}`);
+    if (r.ok && r.keys.length > 0) {
+      const done = await manualFulfillItem(orderItemId, r.keys.join("\n"));
+      if (done.ok) return { ok: true };
+      // Bought and paid for, but the line was already delivered by then. Saying
+      // "ok" here threw the purchased key away without a word.
+      void logWallet("supplier.fulfil", `Supplier key bought but not attached: ${item.productNameSnap}`, { orderItemId, reason: done.reason ?? "unknown" });
+      await enqueueAdminAlert(
+        `⚠️ <b>Supplier key bought but NOT delivered</b>\nProduct: ${esc(item.productNameSnap)}\nReason: ${done.reason ?? "unknown"}\nThe purchase went through — keep it for the next order or refund it with the vendor.`,
+      ).catch(() => undefined);
+      return { ok: false, reason: done.reason ?? "NOT_ATTACHED" };
+    }
+    if (r.rejected) {
+      // The vendor refused — nothing was bought. Say exactly that, and pull the
+      // vendor's catalogue again right now so a product they can no longer
+      // supply (out of stock, our credit with them exhausted) stops being sold
+      // for the next five minutes until the scheduled sync notices.
+      void logWallet("supplier.fulfil", `Supplier rejected the order: ${item.productNameSnap}`, { orderItemId, reason: r.reason ?? "unknown" });
+      if (!(await alertOnce(orderItemId, r.reason ?? "rejected"))) return { ok: false, reason: r.reason ?? "REJECTED" };
+      await enqueueAdminAlert(
+        `⛔ <b>Supplier REJECTED the order — not charged</b>\nProduct: ${esc(item.productNameSnap)}\nVendor says: <code>${esc(r.reason ?? "unknown")}</code>\n\nDeliver this order manually or refund it. If the reason is a balance / limit, top up your account with the vendor. Their catalogue is being re-synced now.`,
+      ).catch(() => undefined);
+      void syncSupplierProducts(supplierId).catch(() => undefined);
+      return { ok: false, reason: r.reason ?? "REJECTED" };
+    }
+    // We could not get a key. Only ACCEPTED_NO_KEY means the vendor took the
+    // order; anything else (no order endpoint found, network error) means
+    // nothing was bought — and the 60 s sweep will try again by itself.
+    const accepted = r.reason === "ACCEPTED_NO_KEY";
+    void logWallet("supplier.fulfil", `${accepted ? "Supplier accepted but no key parsed" : "Supplier order not placed"}: ${item.productNameSnap}`, { orderItemId, reason: r.reason ?? "unknown" });
+    if (await alertOnce(orderItemId, r.reason ?? "unknown")) {
+      await enqueueAdminAlert(
+        accepted
+          ? `⚠️ <b>Supplier accepted the order but sent no key</b>\nProduct: ${esc(item.productNameSnap)}\nIt may have been charged. The bot keeps checking; if it does not arrive, deliver manually. Raw supplier response:\n<code>${esc(r.raw ?? "").slice(0, 400)}</code>`
+          : `⚠️ <b>Could not place the supplier order — nothing was bought</b>\nProduct: ${esc(item.productNameSnap)}\nReason: <code>${esc(r.reason ?? "unknown")}</code>\nThe bot retries every minute. If it keeps failing, check the supplier's URL/key in 🏭 Suppliers or deliver manually.${r.raw ? `\nLast response:\n<code>${esc(r.raw).slice(0, 300)}</code>` : ""}`,
+      ).catch(() => undefined);
+    }
+    return { ok: false, reason: r.reason ?? "NO_KEY" };
+  } finally {
+    await getRedis().del(lockKey).catch(() => undefined);
+  }
+}
+
+/** Auto-buy + deliver every supplier-linked, still-unfulfilled item in an order. Returns count delivered. */
+export async function autoFulfillSupplierItems(orderId: string): Promise<number> {
+  const items = await prisma.orderItem.findMany({ where: { orderId, fulfilledAt: null }, include: { variant: { include: { product: true } } } });
+  let done = 0;
+  for (const it of items) {
+    if (!it.variant.product.supplierId) continue;
+    const r = await fulfillFromSupplier(it.id);
+    if (r.ok) done++;
+  }
+  return done;
+}
+
+/* ── Learn a supplier's API from their own documentation ───────────────────── */
+
+export interface DocsConfig {
+  baseUrl?: string;
+  authHeader?: string; // "Authorization: Bearer" | "X-API-Key"
+  /** The auth style proven to work against this supplier (see detectAuthStyle). */
+  authStyle?: string;
+  productsPath?: string;
+  orderPath?: string;
+  balancePath?: string;
+  listField?: string; // e.g. "data.items"
+  idField?: string;
+  priceField?: string;
+  stockField?: string;
+}
+
+/** Read a nested field path like "data.items" off a parsed JSON body. */
+function atPath(obj: any, path?: string): any {
+  if (!path) return undefined;
+  return path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+
+/**
+ * Parse a supplier's API docs (pasted text or a URL) and extract everything the
+ * connector needs. Deliberately tolerant: anything it cannot find is left unset
+ * and the normal probing still applies.
+ */
+export async function learnSupplierDocs(supplierId: string, input: string): Promise<{ ok: boolean; detail: string; config: DocsConfig }> {
+  const sup = await prisma.supplier.findUnique({ where: { id: supplierId } });
+  if (!sup) return { ok: false, detail: "Supplier not found.", config: {} };
+
+  let text = input.trim();
+  let source = "text";
+  if (/^https?:\/\//i.test(text)) {
+    try {
+      const res = await fetch(text, { headers: { Accept: "text/html,text/plain,application/json" }, signal: AbortSignal.timeout(12_000) });
+      const body = await res.text();
+      text = body.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
+      source = `url (${body.length} chars)`;
+    } catch {
+      return { ok: false, detail: "Couldn't download that docs URL. Paste the documentation text instead.", config: {} };
+    }
+  }
+
+  const cfg: DocsConfig = {};
+  // OpenAPI/Swagger: turn "paths" into the METHOD /path lines the parser expects.
+  try {
+    const spec = JSON.parse(text) as any;
+    if (spec && typeof spec === "object" && spec.paths) {
+      const lines: string[] = [];
+      for (const [pth, ops] of Object.entries(spec.paths as Record<string, any>)) {
+        for (const method of Object.keys(ops ?? {})) {
+          if (["get", "post", "put", "patch"].includes(method.toLowerCase())) lines.push(`${method.toUpperCase()} ${pth}`);
+        }
+      }
+      const servers: string[] = (spec.servers ?? []).map((sv: any) => String(sv?.url ?? "")).filter(Boolean);
+      const schemes = JSON.stringify(spec.components?.securitySchemes ?? spec.securityDefinitions ?? {});
+      text = [servers.length ? `Base URL: ${servers[0]}` : "", /bearer/i.test(schemes) ? "Authorization: Bearer KEY" : /apikey|api_key/i.test(schemes) ? "X-API-Key: KEY" : "", ...lines].filter(Boolean).join("\n");
+    }
+  } catch { /* not JSON — use the text as-is */ }
+  // Base URL: first absolute URL that isn't an image/asset.
+  const urls = [...text.matchAll(/https?:\/\/[^\s"'`<>)]+/gi)].map((m) => m[0]);
+  const apiUrl = urls.find((u) => /\/api\b|\/v\d\b|\/functions\/|developer/i.test(u)) ?? urls[0];
+  if (apiUrl) {
+    try {
+      const u = new URL(apiUrl);
+      // Keep the whole documented path when it is versioned (…/api/v1/developer);
+      // slicing at a fixed offset dropped the trailing segment.
+      const path = u.pathname.replace(/\/+$/, "");
+      cfg.baseUrl = /\/api\/v\d/.test(path)
+        ? `${u.origin}${path.replace(/\/(products|orders|balance|docs(\.txt)?|manifest|openapi\.json|swagger\.json|api-docs|documentation|llms\.txt).*$/i, "")}`
+        : u.origin;
+    } catch { /* ignore */ }
+  }
+  // Auth style.
+  if (/bearer/i.test(text)) cfg.authHeader = "Authorization: Bearer";
+  else if (/x-api-key/i.test(text)) cfg.authHeader = "X-API-Key";
+
+  // Endpoint paths.
+  const findPath = (re: RegExp): string | undefined => {
+    const m = text.match(re);
+    return m?.[1]?.trim();
+  };
+  cfg.productsPath = findPath(/GET\s+\/?((?:api\/)?[\w/{}.\-]*products[\w/{}.\-]*)/i)
+    ?? findPath(/\/?((?:api\/)?[\w/{}.\-]*(?:products|catalog|stock)[\w/{}.\-]*)/i);
+  cfg.orderPath = findPath(/POST\s+\/?((?:api\/)?[\w/{}.\-]*orders?[\w/{}.\-]*)/i);
+  cfg.balancePath = findPath(/GET\s+\/?((?:api\/)?[\w/{}.\-]*balance[\w/{}.\-]*)/i);
+  for (const k of ["productsPath", "orderPath", "balancePath"] as const) {
+    let v = cfg[k];
+    if (!v) continue;
+    if (v.includes("://")) { cfg[k] = undefined; continue; } // an absolute URL is not a path
+    if (!v.startsWith("/")) v = `/${v}`;
+    cfg[k] = v;
+  }
+  // Field mapping hints.
+  // Prefer an actual JSON key ("items": [ … ]) over a word that merely appears
+  // in a URL — matching "products" from "GET /products" picked the wrong field.
+  cfg.listField =
+    findPath(/"(items|products|data|results|list)"\s*:\s*\[/i) ??
+    findPath(/\b(data\.items|data\.products|data\.data|results|list)\b/i) ??
+    undefined;
+  cfg.idField = /variant_?id/i.test(text) ? "variantId" : /product_?id/i.test(text) ? "product_id" : "id";
+  if (/price_?minor|amount_?minor/i.test(text)) cfg.priceField = "priceMinor";
+
+  // Keep the auth style already proven against this supplier; otherwise take
+  // the one the docs name — replacing the config wholesale used to lose it.
+  const prevStyle = (sup.docsConfig as DocsConfig | null)?.authStyle;
+  if (prevStyle) cfg.authStyle = prevStyle;
+  else if (/bearer/i.test(cfg.authHeader ?? "")) cfg.authStyle = "bearer";
+  else if (/x-api-key/i.test(cfg.authHeader ?? "")) cfg.authStyle = "x-api-key";
+  await prisma.supplier.update({ where: { id: supplierId }, data: { docsConfig: cfg as never } });
+
+  // Live check: does the products endpoint actually return items?
+  const probe = await probeProducts({ ...sup, docsConfig: cfg } as never).catch(() => null);
+  const found = probe?.products.length ?? 0;
+
+  const lines = [
+    "📄 <b>Docs processed</b>",
+    `• source: ${source}`,
+    cfg.baseUrl ? `• base URL: <code>${cfg.baseUrl}</code>` : "• base URL: not found (using the one you entered)",
+    cfg.authHeader ? `• auth: <code>${cfg.authHeader} KEY</code>` : "• auth: assuming Bearer + X-API-Key",
+    cfg.productsPath ? `• products: <code>${cfg.productsPath}</code>` : "• products: will auto-probe",
+    cfg.orderPath ? `• order: <code>${cfg.orderPath}</code>` : "• order: will auto-probe",
+    cfg.balancePath ? `• balance: <code>${cfg.balancePath}</code>` : "",
+    cfg.listField ? `• list field: <code>${cfg.listField}</code>` : "",
+    "",
+    found > 0
+      ? `✅ <b>Live check passed</b> — ${found} product(s) readable. Tap 🔄 Sync to import them.`
+      : "⚠️ <b>Live check found 0 products.</b> The key may lack permission, or the catalogue is empty. Tap 🔍 Diagnose for the raw response.",
+  ].filter(Boolean);
+  return { ok: found > 0, detail: lines.join("\n"), config: cfg };
+}
+
+/** Doc locations worth trying on a supplier's host, best-first. */
+const DOC_PATHS = [
+  "/api/v1/developer/docs.txt", "/api/v1/developer/manifest", "/api/v1/developer",
+  "/docs.txt", "/llms.txt", "/manifest",
+  "/openapi.json", "/swagger.json", "/api-docs", "/api/docs", "/docs", "/documentation",
+  "/api/v1/docs", "/developer", "/developers", "/api",
+];
+
+/**
+ * Auto-discover a supplier's API docs when the connector is not working. Tries
+ * the usual documentation locations on their host, picks the most informative
+ * response, and feeds it through learnSupplierDocs.
+ */
+export async function autoFetchSupplierDocs(supplierId: string): Promise<{ ok: boolean; detail: string }> {
+  const sup = await prisma.supplier.findUnique({ where: { id: supplierId } });
+  if (!sup) return { ok: false, detail: "Supplier not found." };
+
+  let origin = sup.baseUrl.replace(/\/$/, "");
+  try { origin = new URL(sup.baseUrl).origin; } catch { /* keep as-is */ }
+
+  const tried: string[] = [];
+  let best: { url: string; text: string; score: number } | null = null;
+
+  for (const path of DOC_PATHS) {
+    const url = `${origin}${path}`;
+    try {
+      const res = await fetch(url, {
+        headers: { ...authHeaders(decKey(sup), styleOf(sup)), Accept: "text/plain,application/json,text/html" },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) { tried.push(`${path} → ${res.status}`); continue; }
+      const raw = await res.text();
+      const text = raw.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
+      // Score by how much the parser will actually be able to use.
+      let score = 0;
+      if (/\b(GET|POST)\s+\//.test(text)) score += 5;
+      if (/products|catalog/i.test(text)) score += 3;
+      if (/orders?/i.test(text)) score += 2;
+      if (/balance/i.test(text)) score += 1;
+      if (/bearer|x-api-key/i.test(text)) score += 2;
+      if (/"paths"\s*:/.test(raw)) score += 6; // OpenAPI
+      if (text.length < 40) score = 0;
+      tried.push(`${path} → ${res.status}, ${raw.length} chars, score ${score}`);
+      if (score > 0 && (!best || score > best.score)) best = { url, text: (/"paths"\s*:/.test(raw) ? raw : text).slice(0, 60_000), score };
+      if (score >= 10) break; // good enough
+    } catch {
+      tried.push(`${path} → unreachable`);
+    }
+  }
+
+  if (!best) {
+    return {
+      ok: false,
+      detail: [
+        "🔎 <b>Couldn't find any documentation</b>",
+        "",
+        "Tried on <code>" + origin + "</code>:",
+        tried.slice(0, 14).map((t) => `• ${t}`).join("\n"),
+        "",
+        "Use 📄 <b>Read API docs</b> and paste the documentation link or text instead.",
+      ].join("\n"),
+    };
+  }
+
+  const learned = await learnSupplierDocs(supplierId, best.text);
+  return {
+    ok: learned.ok,
+    detail: [`🔎 <b>Found docs at</b> <code>${best.url}</code>`, "", learned.detail].join("\n"),
+  };
+}
+
+/**
+ * Safety net: retry supplier fulfilment for paid orders whose items are still
+ * undelivered. Supplier purchase happens fire-and-forget right after checkout
+ * (so a slow vendor cannot stall the customer), which means a crash, restart or
+ * transient vendor error would otherwise leave a paid item never delivered —
+ * the customer sees "being prepared" forever and has to check My Orders.
+ */
+export async function retryPendingSupplierFulfilment(maxOrders = 20): Promise<{ scanned: number; delivered: number }> {
+  const items = await prisma.orderItem.findMany({
+    where: {
+      fulfilledAt: null,
+      variant: { product: { supplierId: { not: null } } },
+      order: { status: { in: ["PAID", "PENDING_FULFILLMENT"] } },
+      createdAt: { lt: new Date(Date.now() - 60_000) }, // give the first attempt a minute
+    },
+    orderBy: { createdAt: "asc" },
+    take: maxOrders,
+    select: { id: true },
+  });
+  let delivered = 0;
+  for (const it of items) {
+    const r = await fulfillFromSupplier(it.id).catch(() => ({ ok: false }));
+    if (r.ok) delivered++;
+  }
+  if (delivered > 0) {
+    // Was logWallet, which writes to the "wallet" channel — supplier events were
+    // landing in a tab the admin never checks for them.
+    await logEvent("supplier", "warn", "supplier.retry", `Recovered ${delivered} undelivered supplier item(s)`, { scanned: items.length });
+  }
+  return { scanned: items.length, delivered };
+}

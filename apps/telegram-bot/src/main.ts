@@ -1,0 +1,91 @@
+import { createServer } from "node:http";
+import { loadConfig } from "@gis/config";
+import { ensureDbObjects, prisma } from "@gis/database";
+import { getRedis, getCustomEmojiRegistry, primeFxRate, getPromoFlags, rememberBotUsername } from "@gis/core";
+import { webhookCallback } from "grammy";
+import { createBot } from "./bot.js";
+import { setDynamicEmojis } from "./emoji.js";
+
+async function main(): Promise<void> {
+  const config = loadConfig();
+  await ensureDbObjects();
+
+  const bot = createBot();
+  // Load admin-registered custom emoji so e() renders them across the UI.
+  try { setDynamicEmojis(await getCustomEmojiRegistry()); } catch { /* non-fatal */ }
+  // Load the admin-set INR<->USDT rate before serving any request.
+  try { await primeFxRate(); } catch { /* falls back to the default */ }
+  try { await getPromoFlags(); } catch { /* defaults to all on */ }
+  await bot.api.setMyCommands([
+    { command: "start", description: "Open the store" },
+    { command: "shop", description: "Browse products" },
+    { command: "help", description: "Help & support" },
+    { command: "wallet", description: "Wallet & deposit" },
+    { command: "orders", description: "My orders" },
+    { command: "replace", description: "Request a replacement" },
+    { command: "referral", description: "Refer & earn" },
+    { command: "api", description: "Developer API" },
+    { command: "language", description: "Change language" },
+  ]);
+
+  const shutdown = async (): Promise<void> => {
+    await bot.stop().catch(() => undefined);
+    await prisma.$disconnect().catch(() => undefined);
+    getRedis().disconnect();
+    process.exit(0);
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+
+  if (config.BOT_MODE === "webhook") {
+    const path = `/webhooks/telegram/${config.WEBHOOK_SECRET_PATH}`;
+    const handler = webhookCallback(bot, "http", { secretToken: config.TELEGRAM_SECRET_TOKEN });
+
+    const server = createServer((req, res) => {
+      if (req.method === "POST" && req.url === path) {
+        void handler(req, res).catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500);
+            res.end();
+          }
+        });
+        return;
+      }
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    server.listen(config.PORT, async () => {
+      await bot.init();
+      await rememberBotUsername(bot.botInfo.username);
+      await bot.api.setWebhook(`${config.WEBHOOK_DOMAIN}${path}`, {
+        secret_token: config.TELEGRAM_SECRET_TOKEN,
+        drop_pending_updates: false,
+        // channel_post: /registergroup is documented as working from a channel,
+        // and a channel never sends "message" — without this Telegram simply
+        // never delivers the command.
+        allowed_updates: ["message", "channel_post", "callback_query", "pre_checkout_query"],
+      });
+      // eslint-disable-next-line no-console
+      console.log(`bot: webhook mode on :${config.PORT}`);
+    });
+  } else {
+    // eslint-disable-next-line no-console
+    console.log("bot: long-polling mode (development)");
+    await bot.start({
+      allowed_updates: ["message", "channel_post", "callback_query", "pre_checkout_query"],
+      onStart: (me) => { void rememberBotUsername(me.username); },
+    });
+  }
+}
+
+main().catch((e) => {
+  // eslint-disable-next-line no-console
+  console.error("fatal", e);
+  process.exit(1);
+});

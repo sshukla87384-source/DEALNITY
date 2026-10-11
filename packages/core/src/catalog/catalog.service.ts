@@ -1,0 +1,725 @@
+import { plainDescription } from "../tg-html.js";
+import { prisma, type Currency } from "@gis/database";
+import { sha256Hex } from "@gis/shared";
+import { CoreError, effectiveHours, PAGE_SIZE } from "@gis/shared";
+import { translateMany } from "../translate.service.js";
+import { convertMinor, convertPriceMinor } from "../fx.js";
+import { cached, invalidate } from "../redis.js";
+import { effectivePriceMinor, isSaleActive, bulkTiersOf, type BulkTier } from "../pricing.js";
+
+const CACHE_TTL = 60;
+
+export interface CategoryNode {
+  id: string;
+  name: string;
+  emoji: string | null;
+  hasChildren: boolean;
+}
+
+export interface ProductListVariant {
+  id: string;
+  name: string;
+  priceMinor: number | null;
+  stock: number;
+}
+
+export interface ProductListItem {
+  id: string;
+  name: string;
+  iconEmoji: string | null;
+  fromPriceMinor: number | null;
+  onSale: boolean;
+  inStock: boolean;
+  /** Total units across variants; null = unlimited (not unit-stocked). */
+  stock: number | null;
+  /** true = stocked/fulfilled by an upstream supplier, still auto-delivered. */
+  supplierBacked: boolean;
+  buttonStyle: string | null;
+  iconCustomEmojiId: string | null;
+  /** Buyable variants — API consumers order by `variants[].id`. */
+  variants: ProductListVariant[];
+}
+
+/** Pull the first custom (premium) emoji id out of stored *Html fields, for use as a button icon. */
+export function firstCustomEmojiId(html: string | null | undefined): string | null {
+  if (!html) return null;
+  const m = html.match(/emoji-id="(\d+)"/);
+  return m?.[1] ?? null;
+}
+
+export interface Paged<T> {
+  items: T[];
+  page: number;
+  pages: number;
+  total: number;
+}
+
+export interface VariantView {
+  id: string;
+  name: string;
+  priceMinor: number | null; // effective (post-sale) price
+  originalPriceMinor: number | null; // pre-sale price when a sale is active
+  stock: number;
+}
+
+export interface ProductView {
+  id: string;
+  name: string;
+  nameHtml: string | null;
+  description: string | null;
+  descriptionHtml: string | null;
+  imageUrl: string | null;
+  iconEmoji: string | null;
+  onSale: boolean;
+  salePercentBp: number | null;
+  bulkLadder: Array<{ minQty: number; percentBp: number; unitPriceMinor: number }>;
+  saleEndsAt: Date | null;
+  type: string;
+  fulfillmentMode: string;
+  activationGuide: string | null;
+  isPlatform: boolean;
+  supplierBacked: boolean;
+  warranty: boolean;
+  warrantyDays: number | null;
+  /** Replacement window in hours — precise; warrantyDays is this rounded up. */
+  warrantyHours: number | null;
+  /** true when THIS customer has a personal price on this product. */
+  hasCustomPrice: boolean;
+  buyButtonText: string | null;
+  buttonStyle: string | null;
+  iconCustomEmojiId: string | null;
+  variants: VariantView[];
+}
+
+/** Sentinel for products that are not unit-stocked (downloads, manual services). */
+export const UNLIMITED_STOCK = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Stock for MANY variants in 2 queries instead of one COUNT each. This was the
+ * single biggest source of latency: a 100-product page issued ~105 sequential
+ * COUNTs.
+ */
+/** Setting: hide sold-out products from the shop list until they are restocked. */
+const HIDE_SOLD_OUT_KEY = "shop.hide_sold_out";
+
+export async function getHideSoldOut(): Promise<boolean> {
+  const row = await prisma.setting.findUnique({ where: { key: HIDE_SOLD_OUT_KEY } });
+  // Default ON: a shop full of ❌ rows reads as abandoned, and every tap on one
+  // is a dead end.
+  return row?.value === undefined || row?.value === null ? true : Boolean(row.value);
+}
+
+export async function setHideSoldOut(on: boolean): Promise<void> {
+  await prisma.setting.upsert({
+    where: { key: HIDE_SOLD_OUT_KEY },
+    create: { key: HIDE_SOLD_OUT_KEY, value: on },
+    update: { value: on },
+  });
+  await invalidate("cat:*");
+}
+
+export async function stockMapFor(
+  rows: Array<{ id: string; type: string; supplierId: string | null; supplierStock: number | null; reusable: boolean; reusableStock: number | null; manual: boolean; manualStock: number | null; variantIds: string[] }>,
+): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  const keyIds: string[] = [];
+  const acctIds: string[] = [];
+  for (const p of rows) {
+    if (p.supplierId && p.supplierStock !== null && p.supplierStock !== undefined) {
+      for (const v of p.variantIds) map.set(v, p.supplierStock);
+      continue;
+    }
+    // A reusable product (same link for everyone) and a MANUAL product are
+    // fulfilled by hand or from one shared value — they are never out of stock
+    // unless the admin hides them.
+    if (p.reusable || p.manual) {
+      // Reusable and manual products may each carry an optional quantity.
+      const declared = p.reusable ? p.reusableStock : p.manualStock;
+      const n = declared !== null && declared !== undefined ? declared : UNLIMITED_STOCK;
+      for (const v of p.variantIds) map.set(v, n);
+      continue;
+    }
+    if (p.type === "LICENSE_KEY") keyIds.push(...p.variantIds);
+    else if (p.type === "DIGITAL_ACCOUNT") acctIds.push(...p.variantIds);
+    else for (const v of p.variantIds) map.set(v, UNLIMITED_STOCK);
+  }
+  const [keys, accts] = await Promise.all([
+    keyIds.length
+      ? prisma.licenseKey.groupBy({ by: ["variantId"], where: { variantId: { in: keyIds }, status: "AVAILABLE", deletedAt: null }, _count: { _all: true } })
+      : Promise.resolve([] as Array<{ variantId: string; _count: { _all: number } }>),
+    acctIds.length
+      ? prisma.digitalAccount.groupBy({ by: ["variantId"], where: { variantId: { in: acctIds }, status: "AVAILABLE", deletedAt: null }, _count: { _all: true } })
+      : Promise.resolve([] as Array<{ variantId: string; _count: { _all: number } }>),
+  ]);
+  for (const id of [...keyIds, ...acctIds]) map.set(id, 0); // absent = 0, not undefined
+  for (const r of keys) map.set(r.variantId, r._count._all);
+  for (const r of accts) map.set(r.variantId, r._count._all);
+  return map;
+}
+
+async function variantStock(
+  variantId: string,
+  type: string,
+  supplier?: { supplierId: string | null; supplierStock: number | null; reusableSecretEnc?: string | null; reusableStock?: number | null; manualStock?: number | null; fulfillmentMode?: string },
+): Promise<number> {
+  // Supplier-backed products are stocked at the supplier, not locally.
+  if (supplier?.supplierId && supplier.supplierStock !== null && supplier.supplierStock !== undefined) {
+    return supplier.supplierStock;
+  }
+  // Reusable / manual products are never unit-stocked.
+  if (supplier?.reusableSecretEnc) return supplier.reusableStock ?? UNLIMITED_STOCK;
+  if (supplier?.fulfillmentMode === "MANUAL") return supplier.manualStock ?? UNLIMITED_STOCK;
+  if (type === "LICENSE_KEY")
+    return prisma.licenseKey.count({ where: { variantId, status: "AVAILABLE", deletedAt: null } });
+  if (type === "DIGITAL_ACCOUNT")
+    return prisma.digitalAccount.count({ where: { variantId, status: "AVAILABLE", deletedAt: null } });
+  return UNLIMITED_STOCK; // downloads / manual services are not unit-stocked
+}
+
+export async function listCategories(parentId: string | null): Promise<CategoryNode[]> {
+  return cached(`cat:tree:${parentId ?? "root"}`, CACHE_TTL, async () => {
+    const cats = await prisma.category.findMany({
+      where: { parentId, isActive: true, deletedAt: null },
+      orderBy: { sortOrder: "asc" },
+      include: { _count: { select: { children: true } } },
+    });
+    return cats.map((c) => ({
+      id: c.id,
+      name: c.name,
+      emoji: c.emoji,
+      hasChildren: c._count.children > 0,
+    }));
+  });
+}
+
+export async function getVariantAvailable(variantId: string): Promise<number> {
+  const v = await prisma.productVariant.findUnique({
+    where: { id: variantId },
+    // variantStock() decides on reusable/manual FIRST, so those fields have to
+    // be selected here. Without them a "same item for everyone" product fell
+    // through to counting LicenseKey rows — of which it has none by design —
+    // so the buy screen reported 0 and the quantity picker offered only "1",
+    // however large a quantity the admin had set.
+    include: {
+      product: {
+        select: {
+          type: true, supplierId: true, supplierStock: true,
+          reusableSecretEnc: true, reusableStock: true,
+          fulfillmentMode: true, manualStock: true,
+        },
+      },
+    },
+  });
+  if (!v) return 0;
+  return variantStock(variantId, v.product.type, v.product);
+}
+
+export async function listProducts(opts: {
+  categoryId?: string;
+  search?: string;
+  featuredOnly?: boolean;
+  currency: Currency;
+  page: number;
+  pageSize?: number;
+  userId?: string;
+  channel?: "DIRECT" | "API";
+  locale?: string;
+  /** Several categories at once — a parent tile includes its children. */
+  categoryIds?: string[];
+  /**
+   * Invert the sold-out filter: list ONLY what is out of stock. This is the
+   * shop's "😴 Sold out" shelf, which is also the one place a customer can ask
+   * to be told when something is back — so hiding sold-out products from the
+   * main list must never make them unreachable.
+   */
+  soldOutOnly?: boolean;
+  /**
+   * Ignore the shop's hide-sold-out setting and list everything. The reseller
+   * API sets this: a partner syncing a catalogue needs to see that an item
+   * exists and is at 0, not have it vanish and reappear.
+   */
+  includeSoldOut?: boolean;
+}): Promise<Paged<ProductListItem>> {
+  const { categoryId, search, featuredOnly, currency, page, userId, channel = "DIRECT" } = opts;
+  const categoryIds = opts.categoryIds && opts.categoryIds.length > 0 ? opts.categoryIds : null;
+  const locale = opts.locale ?? "en";
+  const size = opts.pageSize ?? PAGE_SIZE;
+  // Only the VIP price override is user-dependent, and overrides are rare. Keying
+  // the whole page on userId gave a ~0% hit rate (every user's first shop open
+  // paid full price) and would have stored one 8KB page per user per view. So:
+  // users WITHOUT overrides share one cache entry; only the few who have them
+  // get a private one.
+  const hasOverrides = userId
+    ? await cached(`cat:hasov:${userId}:${channel}`, 300, async () =>
+        (await prisma.userPrice.count({ where: { userId, channel: { in: [channel, "BOTH"] } } })) > 0,
+      ).catch(() => true)
+    : false;
+  const userPart = hasOverrides ? (userId ?? "-") : "-";
+  // Hash the search term so an attacker cannot grow the keyspace with long strings.
+  const searchPart = search ? `s${sha256Hex(search).slice(0, 12)}` : "";
+  const soldOutOnly = opts.soldOutOnly === true;
+  // Hiding is a shop-wide setting; the sold-out shelf ignores it by definition.
+  // Cached with the catalogue: this runs on every shop open, and the toggle
+  // invalidates "cat:*" when it changes.
+  const hideSoldOut = soldOutOnly || opts.includeSoldOut === true
+    ? false
+    : await cached("cat:hidesold", 60, getHideSoldOut).catch(() => true);
+  const cacheKey = `cat:prods:${categoryIds ? `m${sha256Hex(categoryIds.slice().sort().join(",")).slice(0, 10)}` : (categoryId ?? "all")}:${featuredOnly ? "f" : "a"}:${searchPart}:${currency}:${page}:${size}:${userPart}:${channel}:${locale}:${soldOutOnly ? "so" : hideSoldOut ? "h" : "x"}`;
+  return cached(cacheKey, CACHE_TTL, async () => {
+    const where = {
+      status: "ACTIVE" as const,
+      deletedAt: null,
+      ...(categoryIds ? { categoryId: { in: categoryIds } } : categoryId ? { categoryId } : {}),
+      ...(featuredOnly ? { isFeatured: true } : {}),
+      ...(search ? { name: { contains: search, mode: "insensitive" as const } } : {}),
+    };
+    // Stock is counted per variant, not stored on the product, so a WHERE clause
+    // cannot express "in stock". When visibility depends on it we take a bounded
+    // window, decide, and paginate in memory — one page of 20 out of a catalogue
+    // capped at 500 candidates, all of it behind the 60 s cache.
+    // The two findMany calls are written out in full rather than sharing a
+    // spread argument: Prisma infers the row type from the literal, and a spread
+    // widens it until `p.variants` stops existing.
+    const stockDecides = hideSoldOut || soldOutOnly;
+    let products = stockDecides
+      ? await prisma.product.findMany({
+          where,
+          orderBy: [{ pinRank: "desc" }, { sortOrder: "asc" }, { createdAt: "desc" }],
+          take: 500,
+          include: {
+            variants: {
+              where: { isActive: true, deletedAt: null },
+              include: { prices: { where: { currency, tier: { name: "RETAIL" } } } },
+            },
+          },
+        })
+      : await prisma.product.findMany({
+          where,
+          orderBy: [{ pinRank: "desc" }, { sortOrder: "asc" }, { createdAt: "desc" }],
+          skip: (page - 1) * size,
+          take: size,
+          include: {
+            variants: {
+              where: { isActive: true, deletedAt: null },
+              include: { prices: { where: { currency, tier: { name: "RETAIL" } } } },
+            },
+          },
+        });
+    const stockMap = await stockMapFor(
+      products.map((p) => ({ id: p.id, type: p.type, supplierId: p.supplierId, supplierStock: p.supplierStock, reusable: p.reusableSecretEnc !== null, reusableStock: p.reusableStock, manual: p.fulfillmentMode === "MANUAL", manualStock: p.manualStock, variantIds: p.variants.map((v) => v.id) })),
+    );
+    let total: number;
+    let pages: number;
+    if (stockDecides) {
+      const hasStock = (p: (typeof products)[number]): boolean => p.variants.some((v) => (stockMap.get(v.id) ?? 0) > 0);
+      products = products.filter((p) => (soldOutOnly ? !hasStock(p) : hasStock(p)));
+      total = products.length;
+      pages = Math.max(1, Math.ceil(total / size));
+      products = products.slice((page - 1) * size, page * size);
+    } else {
+      total = await prisma.product.count({ where });
+      pages = Math.max(1, Math.ceil(total / size));
+    }
+
+    const overrideMap = userId
+      ? await resolveUserPriceMap(userId, products.map((p) => p.id), channel, currency)
+      : new Map<string, number>();
+    const items: ProductListItem[] = [];
+    for (const p of products) {
+      const onSale = isSaleActive(p);
+      const ov = overrideMap.get(p.id);
+      const priced = ov !== undefined ? [ov] : p.variants.flatMap((v) => v.prices.map((pr) => effectivePriceMinor(pr.amountMinor, p)));
+      // One stock lookup per variant, reused for inStock and the variant rows.
+      const variantRows = p.variants.map((v) => {
+        const base = v.prices[0]?.amountMinor ?? null;
+        return {
+          id: v.id,
+          name: v.name,
+          priceMinor: ov ?? (base === null ? null : effectivePriceMinor(base, p)),
+          stock: stockMap.get(v.id) ?? 0,
+        };
+      });
+      const inStock = variantRows.some((v) => v.stock > 0);
+      const unlimited = variantRows.some((v) => v.stock >= UNLIMITED_STOCK);
+      const stock = unlimited ? null : variantRows.reduce((n, v) => n + v.stock, 0);
+      items.push({
+        id: p.id,
+        name: p.name,
+        iconEmoji: p.iconEmoji,
+        variants: variantRows,
+        fromPriceMinor: priced.length > 0 ? Math.min(...priced) : null,
+        onSale,
+        inStock,
+        stock,
+        supplierBacked: p.supplierId !== null,
+        buttonStyle: p.buttonStyle,
+        iconCustomEmojiId: firstCustomEmojiId(p.nameHtml),
+      });
+    }
+    if (locale !== "en" && items.length > 0) {
+      // Hard 1.5s budget: a cold cache used to serialize one 8s HTTP call PER
+      // item (~160s for a 20-item page). Past the budget we show the originals
+      // and let the cache warm in the background for the next view.
+      const src = items.map((i) => i.name);
+      const names = await Promise.race([
+        translateMany(src, locale),
+        new Promise<null>((res) => setTimeout(() => res(null), 1500)),
+      ]).catch(() => null);
+      if (names) items.forEach((it, i) => { it.name = names[i] ?? it.name; });
+      else void translateMany(src, locale).catch(() => undefined);
+    }
+    return { items, page, pages, total };
+  });
+}
+
+
+/** Resolve a user's per-product override for a channel: a channel-specific price (DIRECT/API) wins over a BOTH price. */
+async function resolveUserPriceMap(
+  userId: string,
+  productIds: string[],
+  channel: "DIRECT" | "API",
+  currency?: Currency,
+): Promise<Map<string, number>> {
+  const rows = await prisma.userPrice.findMany({ where: { userId, productId: { in: productIds }, channel: { in: [channel, "BOTH"] } } });
+  const map = new Map<string, number>();
+  for (const r of rows) {
+    // An override is stored in ITS OWN currency; convert before it is displayed
+    // or charged, or an INR view of a USD override is 100x wrong.
+    const amount = currency && r.currency !== currency ? convertPriceMinor(r.amountMinor, r.currency as Currency, currency) : r.amountMinor;
+    const cur = map.get(r.productId);
+    if (cur === undefined || r.channel === channel) map.set(r.productId, amount);
+  }
+  return map;
+}
+
+async function resolveUserPrice(userId: string, productId: string, channel: "DIRECT" | "API", currency?: Currency): Promise<number | null> {
+  const m = await resolveUserPriceMap(userId, [productId], channel, currency);
+  return m.get(productId) ?? null;
+}
+
+export async function getProductView(productId: string, currency: Currency, userId?: string, channel: "DIRECT" | "API" = "DIRECT", locale = "en"): Promise<ProductView> {
+  // The product page was the one hot read with no cache at all, despite being
+  // the detail view, the deep-link landing page and two API endpoints. Same
+  // namespace as the list, so the existing invalidate("cat:*") already clears it.
+  const hasOv = userId
+    ? await cached(`cat:hasov:${userId}:${channel}`, 300, async () =>
+        (await prisma.userPrice.count({ where: { userId, channel: { in: [channel, "BOTH"] } } })) > 0,
+      ).catch(() => true)
+    : false;
+  return cached(
+    `cat:view:${productId}:${currency}:${hasOv ? (userId ?? "-") : "-"}:${channel}:${locale}`,
+    CACHE_TTL,
+    () => getProductViewUncached(productId, currency, userId, channel, locale),
+  );
+}
+
+async function getProductViewUncached(productId: string, currency: Currency, userId?: string, channel: "DIRECT" | "API" = "DIRECT", locale = "en"): Promise<ProductView> {
+  const p = await prisma.product.findFirst({
+    where: { id: productId, status: "ACTIVE", deletedAt: null },
+    include: {
+      variants: {
+        where: { isActive: true, deletedAt: null },
+        orderBy: { sortOrder: "asc" },
+        include: { prices: { where: { currency, tier: { name: "RETAIL" } } } },
+      },
+    },
+  });
+  if (!p) throw new CoreError("PRODUCT_NOT_FOUND");
+
+  const onSale = isSaleActive(p);
+  // One batched stock lookup for every variant (2 groupBy queries) instead of a
+  // COUNT per variant. The counts were already parallel, but each still burned a
+  // connection-pool slot on the product page.
+  const [override, stockMap] = await Promise.all([
+    userId ? resolveUserPrice(userId, p.id, channel, currency) : Promise.resolve(null),
+    stockMapFor([{
+      id: p.id,
+      type: p.type,
+      supplierId: p.supplierId,
+      supplierStock: p.supplierStock,
+      reusable: p.reusableSecretEnc !== null,
+      reusableStock: p.reusableStock,
+      manual: p.fulfillmentMode === "MANUAL",
+      manualStock: p.manualStock,
+      variantIds: p.variants.map((v) => v.id),
+    }]),
+  ]);
+  const variants: VariantView[] = p.variants.map((v) => {
+    const base = v.prices[0]?.amountMinor ?? null;
+    const eff = override ?? (base === null ? null : effectivePriceMinor(base, p));
+    return {
+      id: v.id,
+      name: v.name,
+      priceMinor: eff,
+      originalPriceMinor: override !== null && base !== null ? base : (onSale && base !== null ? base : null),
+      stock: stockMap.get(v.id) ?? 0,
+    };
+  });
+  // Translation works on the plain text: markup in an imported description
+  // would otherwise come back mangled by the translator.
+  const plainDesc = plainDescription(p.description, null);
+  const tr = locale === "en"
+    ? [p.name, p.description ?? ""]
+    : (await Promise.race([
+        translateMany([p.name, plainDesc], locale),
+        new Promise<null>((res) => setTimeout(() => res(null), 1500)),
+      ]).catch(() => null)) ?? [p.name, plainDesc];
+  const [trName, trDesc] = tr;
+  return {
+    id: p.id,
+    name: trName || p.name,
+    nameHtml: p.nameHtml,
+    description: locale === "en" ? p.description : (trDesc || p.description),
+    descriptionHtml: p.descriptionHtml,
+    imageUrl: p.imageUrl,
+    iconEmoji: p.iconEmoji,
+    onSale,
+    salePercentBp: p.salePercentBp,
+    // Precomputed with the SAME helper the charge uses, so the advertised
+    // per-unit price cannot drift from what the customer is actually billed.
+    // Each rung priced with the SAME helper the charge uses, so what is
+    // advertised is exactly what the customer pays at that quantity.
+    bulkLadder: (() => {
+      const b = p.variants[0]?.prices[0]?.amountMinor ?? null;
+      if (b === null) return [];
+      return bulkTiersOf(p).map((t) => ({
+        minQty: t.minQty,
+        percentBp: t.percentBp,
+        unitPriceMinor: effectivePriceMinor(b, p, new Date(), t.minQty),
+      }));
+    })(),
+    saleEndsAt: p.saleEndsAt,
+    type: p.type,
+    fulfillmentMode: p.fulfillmentMode,
+    activationGuide: p.activationGuide,
+    isPlatform: p.resellerId === null,
+    supplierBacked: p.supplierId !== null,
+    warranty: p.warranty,
+    warrantyDays: p.warrantyDays,
+    warrantyHours: effectiveHours(p.warrantyHours, p.warrantyDays),
+    hasCustomPrice: override !== null,
+    buyButtonText: p.buyButtonText,
+    buttonStyle: p.buttonStyle,
+    iconCustomEmojiId: firstCustomEmojiId(p.nameHtml),
+    variants,
+  };
+}
+
+export async function getProductIdBySlug(slug: string): Promise<string | null> {
+  const p = await prisma.product.findFirst({
+    where: { slug, status: "ACTIVE", deletedAt: null },
+    select: { id: true },
+  });
+  return p?.id ?? null;
+}
+
+// ───────────────────────── Shop by category (brand grid) ─────────────────────────
+
+export interface CategoryTile {
+  id: string;
+  name: string;
+  emoji: string | null;
+  /** Live products in this category (and its children). */
+  count: number;
+  /** Anything actually purchasable right now? Drives the "sold out" styling. */
+  inStock: boolean;
+  /** Featured/hot — shown with a 🔥. */
+  hot: boolean;
+}
+
+/**
+ * Categories as a grid of tiles, for the "Shop by category" screen.
+ *
+ * Counts and stock are resolved in 3 queries for the whole grid rather than one
+ * per tile, and a category with nothing live in it is dropped — an empty tile is
+ * just a dead end for the customer.
+ */
+export async function listCategoryTiles(): Promise<CategoryTile[]> {
+  return cached("cat:tiles", CACHE_TTL, async () => {
+    const cats = await prisma.category.findMany({
+      where: { isActive: true, deletedAt: null },
+      orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
+      select: { id: true, name: true, emoji: true, parentId: true },
+    });
+    if (cats.length === 0) return [];
+
+    // Roll child categories up into their parent, so the grid stays one level.
+    const parentOf = new Map(cats.map((c) => [c.id, c.parentId]));
+    const rootOf = (id: string): string => {
+      let cur = id;
+      for (let i = 0; i < 10; i++) {
+        const p = parentOf.get(cur);
+        if (!p) break;
+        cur = p;
+      }
+      return cur;
+    };
+
+    const products = await prisma.product.findMany({
+      where: { status: "ACTIVE", deletedAt: null },
+      select: {
+        id: true, categoryId: true, isFeatured: true, type: true, supplierId: true,
+        supplierStock: true, reusableSecretEnc: true, reusableStock: true,
+        fulfillmentMode: true, manualStock: true,
+        variants: { where: { isActive: true, deletedAt: null }, select: { id: true } },
+      },
+      take: 5_000,
+    });
+    if (products.length === 0) return [];
+
+    const stock = await stockMapFor(
+      products.map((p) => ({
+        id: p.id, type: p.type, supplierId: p.supplierId, supplierStock: p.supplierStock,
+        reusable: p.reusableSecretEnc !== null, reusableStock: p.reusableStock,
+        manual: p.fulfillmentMode === "MANUAL", manualStock: p.manualStock,
+        variantIds: p.variants.map((v) => v.id),
+      })),
+    );
+
+    const agg = new Map<string, { count: number; inStock: boolean; hot: boolean }>();
+    for (const p of products) {
+      if (!p.categoryId) continue;
+      const root = rootOf(p.categoryId);
+      const live = p.variants.some((v) => (stock.get(v.id) ?? 0) > 0);
+      const cur = agg.get(root) ?? { count: 0, inStock: false, hot: false };
+      cur.count++;
+      if (live) cur.inStock = true;
+      if (p.isFeatured) cur.hot = true;
+      agg.set(root, cur);
+    }
+
+    const byId = new Map(cats.map((c) => [c.id, c]));
+    return [...agg.entries()]
+      .map(([id, a]) => {
+        const c = byId.get(id);
+        return c ? { id, name: c.name, emoji: c.emoji, count: a.count, inStock: a.inStock, hot: a.hot } : null;
+      })
+      .filter((x): x is CategoryTile => x !== null)
+      // In-stock first, then the biggest catalogues, then alphabetically.
+      .sort((a, b) => Number(b.inStock) - Number(a.inStock) || b.count - a.count || a.name.localeCompare(b.name));
+  });
+}
+
+/** Every descendant category id, so a parent tile shows its children's products. */
+export async function categoryIdsUnder(categoryId: string): Promise<string[]> {
+  const cats = await prisma.category.findMany({
+    where: { isActive: true, deletedAt: null },
+    select: { id: true, parentId: true },
+  });
+  const kids = new Map<string, string[]>();
+  for (const c of cats) {
+    if (!c.parentId) continue;
+    kids.set(c.parentId, [...(kids.get(c.parentId) ?? []), c.id]);
+  }
+  const out: string[] = [];
+  const walk = (id: string, depth = 0) => {
+    if (depth > 10 || out.includes(id)) return;
+    out.push(id);
+    for (const k of kids.get(id) ?? []) walk(k, depth + 1);
+  };
+  walk(categoryId);
+  return out;
+}
+
+/** Replace a product's whole discount ladder. */
+export async function setProductBulkTiers(productId: string, tiers: BulkTier[]): Promise<void> {
+  const clean = tiers
+    .filter((t) => t.minQty >= 2 && t.percentBp > 0 && t.percentBp <= 9000)
+    .sort((a, b) => a.minQty - b.minQty);
+  await prisma.product.update({
+    where: { id: productId },
+    data: {
+      // An EMPTY ladder is written as an empty list, not skipped: `undefined`
+      // means "leave this column alone" to Prisma, so "remove bulk discounts"
+      // cleared the legacy columns, reported success, and left the ladder itself
+      // exactly where it was — customers kept getting a discount the operator
+      // had just turned off.
+      bulkTiers: clean as never,
+      // The legacy columns are cleared so they cannot resurface as a fallback
+      // once a ladder exists, which would otherwise reintroduce an old tier the
+      // operator thought they had replaced.
+      bulkMinQty: null,
+      bulkPercentBp: null,
+    },
+  });
+  await invalidate("cat:*");
+}
+
+export interface ResellerPriceRow {
+  productId: string;
+  name: string;
+  iconEmoji: string | null;
+  /** What the reseller pays us. */
+  basePriceMinor: number | null;
+  /** What their API returns, if they have set one. */
+  myPriceMinor: number | null;
+  currency: Currency;
+}
+
+/**
+ * Products a reseller can price, with their own price alongside ours.
+ *
+ * The UserPrice engine already existed and was already applied by the catalog
+ * and at checkout — only a screen to set the API-channel price was missing, so
+ * resellers had no way to reach a feature that was fully built underneath them.
+ */
+export async function listResellerPrices(
+  userId: string,
+  currency: Currency,
+  limit = 40,
+): Promise<ResellerPriceRow[]> {
+  const products = await prisma.product.findMany({
+    where: { status: "ACTIVE", deletedAt: null },
+    orderBy: [{ pinRank: "desc" }, { name: "asc" }],
+    take: limit,
+    select: {
+      id: true, name: true, iconEmoji: true, salePercentBp: true, saleStartsAt: true, saleEndsAt: true,
+      bulkMinQty: true, bulkPercentBp: true, bulkTiers: true,
+      // RETAIL, and the FIRST variant by sort order — everywhere else in this
+      // file already pins both. Without the tier filter a RESELLER_L1 row (the
+      // admin API can write one) could be picked instead, so "what you pay us"
+      // showed a price from a different tier entirely.
+      variants: { where: { isActive: true, deletedAt: null }, orderBy: { sortOrder: "asc" }, take: 1, select: { prices: { where: { currency, tier: { name: "RETAIL" } }, take: 1, select: { amountMinor: true } } } },
+    },
+  });
+  const mine = await prisma.userPrice.findMany({
+    where: { userId, productId: { in: products.map((p) => p.id) }, channel: { in: ["API", "BOTH"] } },
+  });
+  const byProduct = new Map<string, { amountMinor: number; currency: Currency }>();
+  for (const m of mine) {
+    // API beats BOTH, so a channel-specific price is never masked by a general one.
+    const cur = byProduct.get(m.productId);
+    if (!cur || m.channel === "API") byProduct.set(m.productId, { amountMinor: m.amountMinor, currency: m.currency as Currency });
+  }
+  return products.map((p) => {
+    const base = p.variants[0]?.prices[0]?.amountMinor ?? null;
+    const own = byProduct.get(p.id);
+    return {
+      productId: p.id,
+      name: p.name,
+      iconEmoji: p.iconEmoji,
+      basePriceMinor: base === null ? null : effectivePriceMinor(base, p),
+      myPriceMinor: own ? (own.currency === currency ? own.amountMinor : convertMinor(own.amountMinor, own.currency, currency)) : null,
+      currency,
+    };
+  });
+}
+
+/** Set or clear a reseller's own API selling price for one product. */
+export async function setResellerPrice(
+  userId: string,
+  productId: string,
+  amountMinor: number | null,
+  currency: Currency,
+): Promise<void> {
+  if (amountMinor === null) {
+    await prisma.userPrice.deleteMany({ where: { userId, productId, channel: { in: ["API", "BOTH"] } } });
+  } else {
+    await prisma.userPrice.upsert({
+      where: { userId_productId_channel: { userId, productId, channel: "API" } },
+      create: { userId, productId, amountMinor, currency, channel: "API" },
+      update: { amountMinor, currency },
+    });
+  }
+  await invalidate("cat:*");
+}

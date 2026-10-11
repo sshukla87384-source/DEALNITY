@@ -1,0 +1,39 @@
+{
+  "name": "dealnity-store",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev:bot": "pnpm --filter @gis/telegram-bot dev",
+    "build": "turbo build",
+    "typecheck": "turbo typecheck",
+    "test": "turbo test",
+    "lint": "turbo lint",
+    "format": "prettier --write \"**/*.{ts,tsx,md,json}\"",
+    "db:generate": "pnpm --filter @gis/database db:generate",
+    "db:migrate": "pnpm --filter @gis/database db:migrate",
+    "db:deploy": "pnpm --filter @gis/database db:deploy",
+    "db:seed": "pnpm --filter @gis/database db:seed"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@nestjs/core",
+      "@prisma/client",
+      "@prisma/engines",
+      "esbuild",
+      "msgpackr-extract",
+      "prisma"
+    ],
+    "ignoredBuiltDependencies": [
+      "@scarf/scarf"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "prettier": "^3.3.3",
+    "turbo": "^2.3.3",
+    "typescript": "^5.6.3"
+  }
+}
