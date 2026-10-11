@@ -1,5 +1,5 @@
 import { loadConfig } from "@gis/config";
-import { prisma, type Currency } from "@gis/database";
+import { invoiceNumberFor, prisma, type Currency } from "@gis/database";
 import { convertMinor } from "../fx.js";
 import { adjustWallet } from "../wallet/wallet.service.js";
 import type { NormalizedPaymentEvent } from "@gis/payments";
@@ -371,7 +371,7 @@ async function handleSuccess(eventId: string, normalized: NormalizedPaymentEvent
       });
 
       await tx.invoice.create({
-        data: { orderId: order.id, invoiceNumber: order.orderNumber.replace(/^DEAL/, "INV") },
+        data: { orderId: order.id, invoiceNumber: invoiceNumberFor(order.orderNumber) },
       });
       await tx.user.updateMany({
         where: { id: order.userId, firstPurchaseAt: null },

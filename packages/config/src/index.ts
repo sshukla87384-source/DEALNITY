@@ -46,6 +46,8 @@ const envSchema = z
     PUBLIC_API_URL: z.string().url().optional(), // payment redirects / webhook base + media serving
     BOT_USERNAME: z.string().optional(), // for t.me deep-link buttons in announcements
     STORE_NAME: z.string().default("Dealnity Store"), // brand name shown to customers
+    // Order-number prefix, 2-6 capital letters (DEAL → DEAL-2026-000123). Read by @gis/database.
+    ORDER_PREFIX: z.string().regex(/^[A-Za-z]{2,6}$/).optional(),
     // z.coerce.boolean() is JS truthiness: the STRING "false" coerces to TRUE,
     // so these switches could only ever be turned on. Parsed by hand instead.
     BUTTON_STYLES_ENABLED: envBool(true), // native colored buttons + custom-emoji icons (Bot API 9.4)

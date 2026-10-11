@@ -1,4 +1,5 @@
 import { loadConfig } from "@gis/config";
+import { orderPrefix } from "@gis/database";
 import {
   addLicenseKeys,
   addStock,
@@ -3237,7 +3238,7 @@ export async function handleAdminCallback(ctx: Ctx, action: string, args: string
         "🔎 <b>Find an order</b>",
         "",
         "Send any one of:",
-        "• order number — <code>GIS-2026-000123</code> (or just <code>000123</code>)",
+        `• order number — <code>${orderPrefix()}-2026-000123</code> (or just <code>000123</code>)`,
         "• the customer — <code>@username</code> or their Telegram ID",
         "• a product name — <code>netflix</code>",
       ].join("\n"));
@@ -3893,7 +3894,7 @@ export async function handleAdminCallback(ctx: Ctx, action: string, args: string
       return;
     case "fuptest": {
       const c = await getFollowupConfig();
-      const text = renderFollowup(c.text, { name: ctx.from?.first_name ?? "there", order: "DEAL-2026-000128", product: "Office 365 100GB", store: loadConfig().STORE_NAME });
+      const text = renderFollowup(c.text, { name: ctx.from?.first_name ?? "there", order: `${orderPrefix()}-2026-000128`, product: "Office 365 100GB", store: loadConfig().STORE_NAME });
       const kb2 = c.btnText && c.btnUrl ? new InlineKeyboard().url(c.btnText, c.btnUrl) : undefined;
       await ctx.reply(text, { parse_mode: "HTML", ...(kb2 ? { reply_markup: kb2 } : {}) }).catch(async () => {
         await ctx.reply("⚠️ That message failed to send — check the HTML tags and the button link (must start with https://).");

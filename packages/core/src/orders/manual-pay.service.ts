@@ -1,6 +1,6 @@
 import { loadConfig } from "@gis/config";
 import { BINANCE_SESSION_MIN, UPI_SESSION_MIN } from "./binance-window.js";
-import { nextOrderNumber, prisma, type Currency } from "@gis/database";
+import { invoiceNumberFor, nextOrderNumber, prisma, type Currency } from "@gis/database";
 import { CoreError, cb, effectiveHours, encryptSecret, decryptSecret, formatMinor, type CurrencyCode, isCoreError } from "@gis/shared";
 import { enqueueAdminAlert, enqueueTelegramMessage, enqueueTelegramDocument, DELIVERY_BUTTONS, DELIVERY_FOLLOWUP, deliveryButtons } from "../queues.js";
 import { logError, logWallet } from "../logs.service.js";
@@ -455,7 +455,7 @@ export async function confirmManualPayment(orderId: string, actorId?: string): P
 
       await tx.invoice.upsert({
         where: { orderId: order.id },
-        create: { orderId: order.id, invoiceNumber: order.orderNumber.replace(/^DEAL/, "INV") },
+        create: { orderId: order.id, invoiceNumber: invoiceNumberFor(order.orderNumber) },
         update: {},
       });
       await grantReferralRewardTx(tx, {

@@ -57,7 +57,7 @@ import {
   type CartView,
   stripLeadingEmoji,
 } from "@gis/core";
-import { prisma, type Currency } from "@gis/database";
+import { orderPrefix, prisma, type Currency } from "@gis/database";
 import { loadConfig } from "@gis/config";
 import { PROVIDER_LABELS, listEnabledProviders } from "@gis/payments";
 import { cb, decryptSecret, formatDuration } from "@gis/shared";
@@ -928,7 +928,7 @@ export async function helpView(): Promise<View> {
       "/referral — 🎁 refer &amp; earn",
       "/api — 🧑‍💻 developer API",
       "/replace — 🔄 request a replacement (faulty item)",
-      "/track GIS-… — 🔎 status of one order",
+      `/track ${orderPrefix()}-… — 🔎 status of one order`,
       "/language — 🌐 change language",
       "/help — ❓ this guide",
       "",

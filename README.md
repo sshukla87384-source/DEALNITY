@@ -12,17 +12,16 @@ Ye repo **Dealnity Store** brand ke liye alag copy hai — The Crazy Store se po
    ```bash
    sudo mkdir -p /opt/dealnity && sudo chown $USER /opt/dealnity
    git clone https://github.com/sshukla87384-source/DEALNITY.git /opt/dealnity
-   cd /opt/dealnity && cp .env.example .env && chmod 600 .env
+   cd /opt/dealnity
+   ./infrastructure/scripts/init-env.sh yourdomain.com YourBotUsername
    nano .env
    ```
-4. **`.env` mein ye zaroor bharo** (baaki optional):
-   - `NODE_ENV=production`, `BOT_MODE=webhook`
-   - `BOT_TOKEN`, `BOT_USERNAME` (bina @)
-   - `NGINX_DOMAIN=yourdomain.com`, `WEBHOOK_DOMAIN=https://api.yourdomain.com`, `PUBLIC_API_URL=https://api.yourdomain.com`, `NEXT_PUBLIC_API_URL=https://api.yourdomain.com`, `ADMIN_PANEL_ORIGIN=https://admin.yourdomain.com`
-   - `DATABASE_URL=postgresql://gis:<POSTGRES_PASSWORD>@postgres:5432/gis`, `REDIS_URL=redis://redis:6379`, `POSTGRES_PASSWORD=<strong password>`
-   - `ENCRYPTION_MASTER_KEY`, `JWT_SECRET`, `WEBHOOK_SECRET_PATH`, `TELEGRAM_SECRET_TOKEN` — har ek ke liye `openssl rand -hex 32` (**naye** values; The Crazy Store wale reuse mat karna)
-   - `BOT_ADMIN_PASSCODE`, `BOT_ADMIN_IDS` (aapka Telegram numeric ID)
-   - `STORE_NAME=Dealnity Store`
+   `init-env.sh` saare secrets (ENCRYPTION_MASTER_KEY, JWT_SECRET, DB password, webhook secrets, /admin passcode) **naye** generate karke `.env` bana deta hai, aur domain wale sab URLs bhar deta hai.
+4. **`.env` mein bas ye bharna baaki rahega:**
+   - `BOT_TOKEN` (@BotFather se)
+   - `BOT_ADMIN_IDS` (aapka Telegram numeric ID)
+   - Payment values jo use karoge: `UPI_ID`, `BINANCE_PAY_UID`, …
+   - Optional: `ORDER_PREFIX` (default `DEAL` → `DEAL-2026-000123`)
 5. **Deploy:** `./infrastructure/scripts/deploy.sh full`
 6. **`ENCRYPTION_MASTER_KEY` ka offline backup** zaroor rakho — iske bina saved keys/accounts kabhi decrypt nahi honge.
 7. Bot mein `/admin` → passcode → payments (UPI / Binance / crypto), products, suppliers sab yahin se set karo.

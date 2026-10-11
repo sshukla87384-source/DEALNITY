@@ -127,7 +127,7 @@ import {
   type DeliveredSecret,
   getMaintenance,
 } from "@gis/core";
-import type { Currency } from "@gis/database";
+import { orderPrefix, type Currency } from "@gis/database";
 import {
   PRODUCT_DEEPLINK_PREFIX,
   cb,
@@ -695,12 +695,12 @@ export function createBot(): Bot<Ctx> {
     return showHome(ctx);
   });
   bot.command("menu", async (ctx) => showHome(ctx));
-  // /track GIS-2026-000123 — status of one order, no secrets, shareable.
+  // /track DEAL-2026-000123 — status of one order, no secrets, shareable.
   bot.command("track", async (ctx) => {
     const num = ctx.match.trim().toUpperCase();
     if (!num) {
       ctx.session.awaiting = "track_order";
-      return ctx.reply("🔎 Send the order number you want to track (e.g. <code>GIS-2026-000123</code>):", { parse_mode: "HTML" });
+      return ctx.reply(`🔎 Send the order number you want to track (e.g. <code>${orderPrefix()}-2026-000123</code>):`, { parse_mode: "HTML" });
     }
     return ctx.reply(await trackText(ctx.user.id, num), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📦 My orders", cb("ord", "list", 1)).text("🏠 Menu", "mnu:home") });
   });

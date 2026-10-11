@@ -46,7 +46,7 @@ export function Sidebar() {
 
   return (
     <aside className="flex w-60 shrink-0 flex-col bg-slate-900 text-slate-300">
-      <div className="px-5 py-5 text-lg font-semibold text-white">Dealnity Store</div>
+      <div className="px-5 py-5 text-lg font-semibold text-teal-300">Dealnity Store</div>
       <nav className="flex-1 space-y-1 px-3">
         {NAV.map(({ href, label, icon: Icon }) => {
           const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
@@ -56,7 +56,7 @@ export function Sidebar() {
               href={href}
               className={cn(
                 "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition",
-                active ? "bg-slate-700 text-white" : "hover:bg-slate-800",
+                active ? "bg-teal-700 text-white" : "hover:bg-slate-800",
               )}
             >
               <Icon size={16} />

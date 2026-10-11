@@ -1,5 +1,5 @@
 import { loadConfig } from "@gis/config";
-import { nextOrderNumber, prisma, type Currency } from "@gis/database";
+import { invoiceNumberFor, nextOrderNumber, prisma, type Currency } from "@gis/database";
 import { CoreError, encryptSecret, isCoreError } from "@gis/shared";
 import { convertMinor } from "../fx.js";
 import { logWallet } from "../logs.service.js";
@@ -262,7 +262,7 @@ export async function checkoutWithWallet(
 
       // 6) Invoice row (PDF rendering lands with the notifications phase).
       await tx.invoice.create({
-        data: { orderId: order.id, invoiceNumber: orderNumber.replace(/^DEAL/, "INV") },
+        data: { orderId: order.id, invoiceNumber: invoiceNumberFor(orderNumber) },
       });
 
       // 7) Finalize order status, first-purchase marker, cart cleanup, audit.
@@ -411,7 +411,7 @@ export async function checkoutWithBnpl(userId: string, channel: "DIRECT" | "API"
       const { deliveries, pendingManualItems } = await fulfillLinesTx(tx, order.id, lines, masterKey, currency as Currency);
 
       await tx.user.update({ where: { id: userId }, data: { bnplOutstandingMinor: { increment: totalMinor } } });
-      await tx.invoice.create({ data: { orderId: order.id, invoiceNumber: orderNumber.replace(/^DEAL/, "INV") } });
+      await tx.invoice.create({ data: { orderId: order.id, invoiceNumber: invoiceNumberFor(orderNumber) } });
 
       const finalStatus = pendingManualItems > 0 ? "PENDING_FULFILLMENT" : "COMPLETED";
       await tx.order.update({ where: { id: order.id }, data: { status: finalStatus, ...(finalStatus === "COMPLETED" ? { completedAt: new Date() } : {}) } });
